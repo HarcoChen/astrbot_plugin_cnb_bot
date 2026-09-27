@@ -73,14 +73,15 @@ class CNBReportPlugin(Star):
         data_dir.mkdir(parents=True, exist_ok=True)
         self.store = TaskStore(data_dir / "reports.sqlite3")
         self.jobs = ReportJobs(context, self.config, self.store, data_dir)
-        self._started = False
+
+    async def initialize(self) -> None:
+        # Plugin initialization also runs on hot reload; the global loaded event
+        # alone does not cover that lifecycle.
+        self.jobs.start()
 
     @filter.on_astrbot_loaded()
     async def on_astrbot_loaded(self) -> None:
-        if not self._started:
-            self.jobs.start()
-            self._started = True
-            logger.info("CNB 报障插件后台任务已启动。")
+        self.jobs.start()
 
     async def terminate(self) -> None:
         await self.jobs.shutdown()
@@ -103,7 +104,7 @@ class CNBReportPlugin(Star):
         elif action in {"status", "状态"}:
             task = self.store.find_current(*scope)
             if task:
-                task = await self.jobs.refresh_task(task["id"]) or task
+                task = await self.jobs.refresh_task(task["id"], notify=False) or task
                 task = self.store.get(task["id"]) or task
                 if task["status"] == "WAITING_NPC" and task.get("last_poll_error"):
                     response = "已刷新完整报障状态；刚刚查询 CNB 评论失败，插件会自动重试。\n" + self._format_status(task)
@@ -114,10 +115,19 @@ class CNBReportPlugin(Star):
         elif action in {"resolve", "resolved", "恢复", "已恢复"}:
             task = self.store.find_current(*scope)
             if task:
+                previous_status = str(task.get("status", ""))
                 platform_name, bot_id, group_id, sender_id = scope
                 _, response = await self.jobs.confirm_recovery(
                     task["id"], sender_id, platform_name, bot_id, group_id
                 )
+                latest = self.store.get(task["id"])
+                if (
+                    previous_status != "DONE"
+                    and latest
+                    and latest.get("status") == "DONE"
+                ):
+                    # _finish already sent the completion notice with a mention.
+                    response = ""
             else:
                 response = "你在此群还没有报障。"
         elif action in {"cancel", "取消"}:
@@ -129,7 +139,8 @@ class CNBReportPlugin(Star):
                 response = "你在此群还没有报障。"
         else:
             response = _HELP
-        yield event.plain_result(response)
+        if response:
+            yield event.plain_result(response)
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_group_message(self, event: AstrMessageEvent):

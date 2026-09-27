@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-import logging
+from contextvars import ContextVar
 import re
 import time
 from pathlib import Path
 from typing import Any
 
+from astrbot.api import logger as log
+
 from .cnb_client import CNBAPIError, CNBClient, CNBNetworkError
 from .qq_files import FileInputError, stage_zip_file
 from .storage import ACTIVE_STATUSES, TaskStore, TERMINAL_STATUSES
-
-log = logging.getLogger("astrbot_plugin_cnb_bot")
 
 STATUS_LABELS = {
     "WAITING_LOG": "等待日志上传",
@@ -112,6 +112,7 @@ class ReportJobs:
         self._runner: asyncio.Task | None = None
         self._stopping = asyncio.Event()
         self._task_locks: dict[str, asyncio.Lock] = {}
+        self._quiet_task: ContextVar[str | None] = ContextVar("cnb_quiet_task", default=None)
 
     def _client(self, repo: str | None = None) -> CNBClient:
         return CNBClient(
@@ -130,6 +131,7 @@ class ReportJobs:
         if self._runner is None or self._runner.done():
             self._stopping.clear()
             self._runner = asyncio.create_task(self._run(), name="cnb-report-jobs")
+            log.info("CNB 报障插件后台任务已启动，NPC 轮询间隔 %s 秒。", self._poll_interval())
 
     async def shutdown(self) -> None:
         self._stopping.set()
@@ -308,7 +310,15 @@ class ReportJobs:
             except Exception:
                 log.exception("处理报障任务 %s 时发生异常", task.get("id"))
 
-    async def refresh_task(self, task_id: str) -> dict[str, Any] | None:
+    async def refresh_task(self, task_id: str, *, notify: bool = True) -> dict[str, Any] | None:
+        # Suppress only this refresh's notices, never another concurrent task's.
+        token = self._quiet_task.set(None if notify else task_id)
+        try:
+            return await self._refresh_task(task_id)
+        finally:
+            self._quiet_task.reset(token)
+
+    async def _refresh_task(self, task_id: str) -> dict[str, Any] | None:
         """Advance this task through every safe state transition immediately."""
         for _ in range(16):
             task = self.store.get(task_id)
@@ -365,6 +375,13 @@ class ReportJobs:
             latest = self.store.get(task_id)
             if not latest:
                 return None
+            if (
+                latest.get("status") == "DELIVERING"
+                and float(latest.get("next_delivery_at", 0)) > time.time()
+            ):
+                # Polling already attempted delivery in this refresh. Honor its
+                # newly scheduled retry instead of immediately sending again.
+                return latest
             if (
                 latest.get("status") == "UNCERTAIN"
                 and latest.get("uncertain_kind") == "trigger_comment"
@@ -742,6 +759,12 @@ class ReportJobs:
                     },
                     expected_statuses={"TRIGGERING_NPC"},
                 )
+                if transitioned and transitioned["status"] == "WAITING_NPC":
+                    log.info(
+                        "报障 %s 已进入 NPC 等待阶段，将每 %s 秒查询一次 CNB 评论。",
+                        task_id,
+                        self._poll_interval(),
+                    )
                 if transitioned and transitioned["status"] == "CANCELLED":
                     await self._notify(
                         transitioned,
@@ -990,6 +1013,7 @@ class ReportJobs:
                     await self._schedule_poll(latest, exc)
 
     async def _poll_npc_locked(self, task: dict[str, Any]) -> None:
+        log.info("报障 %s 开始查询 NPC 评论。", task["id"])
         try:
             comments = await self._all_issue_comments(task)
         except (CNBAPIError, CNBNetworkError) as exc:
@@ -1102,8 +1126,15 @@ class ReportJobs:
             return None
 
     async def _schedule_poll(self, task: dict[str, Any], error: Exception | None = None) -> None:
-        attempts = int(task.get("poll_attempts", 0)) + 1
-        delay = min(self._poll_interval() * (2 ** min(attempts - 1, 5)), 120)
+        if error:
+            # Back off only while CNB is failing. A successful query with no NPC
+            # result should keep the configured cadence so a newly posted reply
+            # is not hidden behind an increasing wait of up to two minutes.
+            attempts = int(task.get("poll_attempts", 0)) + 1
+            delay = min(self._poll_interval() * (2 ** min(attempts - 1, 5)), 120)
+        else:
+            attempts = 0
+            delay = self._poll_interval()
         fields: dict[str, Any] = {
             "poll_attempts": attempts,
             "next_poll_at": time.time() + delay,
@@ -1190,6 +1221,7 @@ class ReportJobs:
             },
             expected_statuses={"DELIVERING"},
         )
+        log.info("报障 %s NPC 分析转发成功（%s/%s）。", task["id"], index + 1, len(parts))
         if (
             updated
             and updated["status"] == "DELIVERING"
@@ -1344,9 +1376,9 @@ class ReportJobs:
         lock = self._task_locks.setdefault(task_id, asyncio.Lock())
         async with lock:
             task = self.store.get(task_id) or task
-            eligible = task.get("status") == "AWAITING_RECOVERY" or (
-                task.get("status") == "DONE" and bool(task.get("issue_number"))
-            )
+            if task.get("status") == "DONE":
+                return True, "该报障已完成，CNB Issue 已关闭。"
+            eligible = task.get("status") == "AWAITING_RECOVERY"
             if eligible:
                 now = time.time()
                 task = self.store.update(
@@ -1381,8 +1413,13 @@ class ReportJobs:
         return max(1.0, min(timeout, 300.0))
 
     async def _notify(self, task: dict[str, Any], text: str) -> None:
+        if self._quiet_task.get() == str(task["id"]):
+            return
         try:
-            await self._send_to_group(task, text, mention=True)
+            await asyncio.wait_for(
+                self._send_to_group(task, text, mention=True),
+                timeout=self._delivery_send_timeout(),
+            )
         except Exception:
             log.exception("向原群发送报障状态失败：%s", task.get("id"))
 
@@ -1403,11 +1440,8 @@ class ReportJobs:
         from astrbot.api.event import MessageChain
         import astrbot.api.message_components as Comp
 
-        # OneBot v11 requires forward nodes to be sent separately from normal
-        # message segments, so send the mention first and the forward card next.
-        if task.get("user_id"):
-            await self._send_to_group(task, "NPC 分析结果：", mention=True)
-
+        # The completion notice mentions the user after successful delivery.
+        # Do not resend a separate preamble on every forwarding retry.
         chain = MessageChain()
         chain.chain.append(
             Comp.Node(

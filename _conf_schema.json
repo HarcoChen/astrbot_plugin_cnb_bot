@@ -52,7 +52,7 @@
     "default": 1200
   },
   "poll_interval_seconds": {
-    "description": "NPC 评论轮询的初始间隔，单位秒。",
+    "description": "NPC 评论正常轮询间隔，单位秒；CNB 请求失败时会按此间隔递增退避。",
     "type": "int",
     "default": 10
   },
