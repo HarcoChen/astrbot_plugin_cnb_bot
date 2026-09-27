@@ -168,6 +168,25 @@ class CNBClient:
         result.setdefault("html_url", self.issue_url(str(result["number"])))
         return result
 
+    def get_issue(self, issue_number: str) -> dict[str, Any]:
+        result = self._request_json(
+            "GET",
+            f"/{self._repo_path()}/-/issues/{urllib.parse.quote(str(issue_number), safe='')}",
+        )
+        if not isinstance(result, dict):
+            raise CNBAPIError("CNB Issue 查询响应格式异常。")
+        return result
+
+    def close_issue(self, issue_number: str) -> dict[str, Any]:
+        result = self._request_json(
+            "PATCH",
+            f"/{self._repo_path()}/-/issues/{urllib.parse.quote(str(issue_number), safe='')}",
+            {"state": "closed", "state_reason": "completed"},
+        )
+        if not isinstance(result, dict):
+            raise CNBAPIError("CNB Issue 关闭响应格式异常。")
+        return result
+
     def issue_url(self, issue_number: str) -> str:
         repo = urllib.parse.quote(self.repository, safe="/")
         number = urllib.parse.quote(str(issue_number), safe="")

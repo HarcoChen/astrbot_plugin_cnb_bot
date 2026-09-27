@@ -22,6 +22,8 @@ STATUS_LABELS = {
     "TRIGGERING_NPC": "正在请求 NPC 分析",
     "WAITING_NPC": "等待 NPC 最终分析",
     "DELIVERING": "正在发送 NPC 分析转发",
+    "AWAITING_RECOVERY": "等待用户确认恢复",
+    "CLOSING_ISSUE": "正在关闭 CNB Issue",
     "DONE": "已完成",
     "EXPIRED": "等待日志超时",
     "CANCELLED": "已取消",
@@ -235,6 +237,18 @@ class ReportJobs:
                     },
                     expected_statuses={"TRIGGERING_NPC"},
                 )
+            elif status == "AWAITING_RECOVERY":
+                self.store.update(
+                    task["id"],
+                    fields={"next_issue_check_at": now},
+                    expected_statuses={"AWAITING_RECOVERY"},
+                )
+            elif status == "CLOSING_ISSUE":
+                self.store.update(
+                    task["id"],
+                    fields={"next_issue_close_at": now},
+                    expected_statuses={"CLOSING_ISSUE"},
+                )
 
     async def _run(self) -> None:
         try:
@@ -285,10 +299,169 @@ class ReportJobs:
                         await self._reconcile_trigger(task)
                 elif status == "DELIVERING" and float(task.get("next_delivery_at", 0)) <= now:
                     await self._deliver(task)
+                elif status == "AWAITING_RECOVERY" and float(task.get("next_issue_check_at", 0)) <= now:
+                    await self._sync_issue_lifecycle(str(task["id"]))
+                elif status == "CLOSING_ISSUE" and float(task.get("next_issue_close_at", 0)) <= now:
+                    await self._close_issue_after_confirmation(str(task["id"]))
             except asyncio.CancelledError:
                 raise
             except Exception:
                 log.exception("处理报障任务 %s 时发生异常", task.get("id"))
+
+    async def refresh_task(self, task_id: str) -> dict[str, Any] | None:
+        """Advance this task through every safe state transition immediately."""
+        for _ in range(16):
+            task = self.store.get(task_id)
+            if not task:
+                return None
+            status = str(task.get("status", ""))
+            if status in TERMINAL_STATUSES:
+                return task
+
+            if status == "WAITING_LOG":
+                if float(task.get("deadline", 0)) <= time.time():
+                    await self._finish(task, "EXPIRED", "等待日志上传超时。")
+                    continue
+                return task
+            if status == "PREPARING_LOG":
+                await self._refresh_preparing_log(task_id)
+            elif status == "CREATING_ISSUE":
+                phase = str(task.get("external_phase", "prepared"))
+                if phase in {"prepared", "asset_upload", "asset_uploaded"}:
+                    # The create routine serializes with attachment processing and
+                    # safely resumes upload phases. It never repeats issue_create.
+                    await self._create_issue_from_prepared(task_id)
+                else:
+                    await self._mark_issue_creation_uncertain(task)
+            elif status == "TRIGGERING_NPC":
+                await self._refresh_triggering_npc(task_id)
+            elif status == "WAITING_NPC":
+                if float(task.get("analysis_deadline", 0)) <= time.time():
+                    await self._finish(
+                        task,
+                        "FAILED",
+                        "等待 NPC 最终回复超时；已创建的 Issue 保留。",
+                    )
+                else:
+                    await self._poll_npc(task)
+            elif status == "UNCERTAIN":
+                if task.get("uncertain_kind") == "trigger_comment":
+                    await self._reconcile_trigger(task)
+                else:
+                    return task
+            elif status == "DELIVERING":
+                # Ignore scheduled backoff for an explicit user refresh. A send
+                # timeout is still enforced inside _deliver_locked.
+                await self._deliver(task)
+            elif status == "AWAITING_RECOVERY":
+                await self._sync_issue_lifecycle(task_id)
+            elif status == "CLOSING_ISSUE":
+                await self._close_issue_after_confirmation(task_id)
+            else:
+                return task
+
+            latest = self.store.get(task_id)
+            if not latest:
+                return None
+            if (
+                latest.get("status") == "UNCERTAIN"
+                and latest.get("uncertain_kind") == "trigger_comment"
+            ):
+                return latest
+            if latest.get("status") == status:
+                # The current stage was checked, but its external dependency has
+                # not advanced yet (or a retry was scheduled).
+                return latest
+
+        log.warning("报障 %s 的状态刷新达到单次推进上限。", task_id)
+        return self.store.get(task_id)
+
+    async def _refresh_preparing_log(self, task_id: str) -> None:
+        lock = self._task_locks.setdefault(task_id, asyncio.Lock())
+        async with lock:
+            task = self.store.get(task_id)
+            if not task or task.get("status") != "PREPARING_LOG":
+                return
+            prepared = str(task.get("prepared_path", ""))
+            if prepared and Path(prepared).is_file():
+                self.store.update(
+                    task_id,
+                    status="CREATING_ISSUE",
+                    fields={"external_phase": "prepared"},
+                    expected_statuses={"PREPARING_LOG"},
+                )
+                return
+
+            now = time.time()
+            (self.temp_dir / f"{task_id}.zip").unlink(missing_ok=True)
+            (self.prepared_dir / f"{task_id}.txt").unlink(missing_ok=True)
+            (self.prepared_dir / f"{task_id}.zip").unlink(missing_ok=True)
+            if float(task.get("deadline", 0)) <= now:
+                await self._finish(task, "EXPIRED", "等待日志上传超时。")
+                return
+            updated = self.store.update(
+                task_id,
+                status="WAITING_LOG",
+                fields={"last_error": "上次准备 ZIP 上传时被中断，请重新上传。"},
+                expected_statuses={"PREPARING_LOG"},
+            )
+            if updated and updated.get("status") == "WAITING_LOG":
+                await self._notify(
+                    updated,
+                    f"报障 {task_id} 的 ZIP 上传准备已中断，请在原等待时限内重新上传。",
+                )
+
+    async def _refresh_triggering_npc(self, task_id: str) -> None:
+        lock = self._task_locks.setdefault(task_id, asyncio.Lock())
+        async with lock:
+            task = self.store.get(task_id)
+            if not task or task.get("status") != "TRIGGERING_NPC":
+                return
+            now = time.time()
+            uncertain = self.store.update(
+                task_id,
+                status="UNCERTAIN",
+                fields={
+                    "uncertain_kind": "trigger_comment",
+                    "last_error": "正在核对 NPC 触发评论是否已创建；不会重复提交。",
+                    "next_poll_at": now,
+                    "poll_attempts": 0,
+                },
+                expected_statuses={"TRIGGERING_NPC"},
+            )
+        if uncertain and uncertain.get("status") == "UNCERTAIN":
+            await self._reconcile_trigger(uncertain)
+
+    async def _mark_issue_creation_uncertain(self, task: dict[str, Any]) -> None:
+        task_id = str(task["id"])
+        lock = self._task_locks.setdefault(task_id, asyncio.Lock())
+        async with lock:
+            current = self.store.get(task_id)
+            if not current or current.get("status") != "CREATING_ISSUE":
+                return
+            updated = self.store.update(
+                task_id,
+                status="UNCERTAIN",
+                fields={
+                    "uncertain_kind": "issue_creation",
+                    "last_error": "插件无法确认 Issue 创建请求是否成功；为避免重复，没有再次创建。",
+                    "description": "",
+                    "context_snapshot": "",
+                    "prepared_path": "",
+                    "attachment_summary": {},
+                    "key_log_excerpt": "",
+                    "source_filename": "",
+                },
+                expected_statuses={"CREATING_ISSUE"},
+            )
+        if updated and updated.get("status") == "UNCERTAIN":
+            path = current.get("prepared_path")
+            if path:
+                Path(path).unlink(missing_ok=True)
+            await self._notify(
+                updated,
+                f"报障 {task_id} 的 Issue 创建结果需要核对。为避免重复 Issue，请在目标仓库按报障编号搜索。",
+            )
 
     async def accept_attachment(self, task_id: str, component) -> tuple[bool, str]:
         lock = self._task_locks.setdefault(task_id, asyncio.Lock())
@@ -743,11 +916,22 @@ class ReportJobs:
         return comments
 
     async def _reconcile_trigger(self, task: dict[str, Any]) -> None:
+        lock = self._task_locks.setdefault(str(task["id"]), asyncio.Lock())
+        async with lock:
+            current = self.store.get(str(task["id"]))
+            if current and current.get("status") == "UNCERTAIN":
+                await self._reconcile_trigger_locked(current)
+
+    async def _reconcile_trigger_locked(self, task: dict[str, Any]) -> None:
         if task.get("status") != "UNCERTAIN":
             return
         try:
             comments = await self._all_issue_comments(task)
         except (CNBAPIError, CNBNetworkError) as exc:
+            await self._schedule_poll(task, exc)
+            return
+        except Exception as exc:
+            log.exception("报障 %s 核对 NPC 触发评论时发生异常。", task["id"])
             await self._schedule_poll(task, exc)
             return
         trigger_body = str(task.get("trigger_body", ""))
@@ -875,7 +1059,7 @@ class ReportJobs:
             expected_statuses={"WAITING_NPC"},
         )
         if transitioned and transitioned["status"] == "DELIVERING":
-            await self._deliver(transitioned)
+            await self._deliver_locked(transitioned)
 
     def _trusted_npc_author(self, comment: dict[str, Any]) -> bool:
         author = comment.get("author") or comment.get("user") or {}
@@ -932,21 +1116,19 @@ class ReportJobs:
         )
 
     async def _deliver(self, task: dict[str, Any]) -> None:
+        lock = self._task_locks.setdefault(str(task["id"]), asyncio.Lock())
+        async with lock:
+            current = self.store.get(str(task["id"]))
+            if current and current.get("status") == "DELIVERING":
+                await self._deliver_locked(current)
+
+    async def _deliver_locked(self, task: dict[str, Any]) -> None:
         if task["status"] != "DELIVERING":
             return
         parts = list(task.get("delivery_parts", []) or [])
         index = int(task.get("delivery_next_part", 0))
         if index >= len(parts):
-            await self._finish(
-                task,
-                "DONE",
-                "NPC 分析已转发完成。",
-                extra_fields={
-                    "delivered_parts": len(parts),
-                    "delivery_parts": [],
-                    "analysis_body": "",
-                },
-            )
+            await self._await_recovery_confirmation(task, int(task.get("delivered_parts", len(parts))))
             return
         try:
             await asyncio.wait_for(
@@ -1008,16 +1190,183 @@ class ReportJobs:
             and updated["status"] == "DELIVERING"
             and int(updated.get("delivery_next_part", 0)) >= len(parts)
         ):
-            await self._finish(
-                updated,
-                "DONE",
-                "NPC 分析已转发完成。",
-                extra_fields={
-                    "delivered_parts": len(parts),
-                    "delivery_parts": [],
-                    "analysis_body": "",
-                },
+            await self._await_recovery_confirmation(updated, len(parts))
+
+    async def _await_recovery_confirmation(self, task: dict[str, Any], delivered_parts: int) -> None:
+        await self._finish(
+            task,
+            "AWAITING_RECOVERY",
+            "NPC 分析已转发。请按建议处理并确认恢复后发送 /debug resolve；插件随后会关闭 CNB Issue。",
+            extra_fields={
+                "delivered_parts": delivered_parts,
+                "delivery_parts": [],
+                "analysis_body": "",
+                "issue_state": task.get("issue_state") or "open",
+                "next_issue_check_at": time.time() + self._issue_check_interval(),
+                "last_issue_error": "",
+            },
+        )
+
+    def _issue_check_interval(self) -> int:
+        try:
+            seconds = int(self.config.get("issue_check_interval_seconds", 30))
+        except (TypeError, ValueError):
+            seconds = 30
+        return max(5, min(seconds, 300))
+
+    @staticmethod
+    def _issue_state(issue: dict[str, Any]) -> str:
+        state = str(issue.get("state", "")).strip().lower()
+        if state not in {"open", "closed"}:
+            raise CNBAPIError("CNB Issue 查询响应缺少有效的 state。")
+        return state
+
+    async def _sync_issue_lifecycle(self, task_id: str) -> None:
+        lock = self._task_locks.setdefault(task_id, asyncio.Lock())
+        async with lock:
+            task = self.store.get(task_id)
+            if not task or task.get("status") != "AWAITING_RECOVERY":
+                return
+            try:
+                client = self._client(str(task.get("repository", "")))
+                issue = await asyncio.to_thread(
+                    client.get_issue, str(task.get("issue_number", ""))
+                )
+                state = self._issue_state(issue)
+                if state == "closed":
+                    # An external close is not proof that the reporting user
+                    # confirmed recovery. Keep awaiting /debug resolve.
+                    self.store.update(
+                        task_id,
+                        fields={
+                            "issue_state": "closed",
+                            "next_issue_check_at": time.time() + self._issue_check_interval(),
+                            "last_issue_error": "",
+                        },
+                        expected_statuses={"AWAITING_RECOVERY"},
+                    )
+                    return
+                self.store.update(
+                    task_id,
+                    fields={
+                        "issue_state": "open",
+                        "next_issue_check_at": time.time() + self._issue_check_interval(),
+                        "last_issue_error": "",
+                    },
+                    expected_statuses={"AWAITING_RECOVERY"},
+                )
+            except Exception as exc:
+                log.warning("报障 %s 检查 CNB Issue 状态失败：%s", task_id, exc)
+                self.store.update(
+                    task_id,
+                    fields={
+                        "next_issue_check_at": time.time() + self._issue_check_interval(),
+                        "last_issue_error": str(exc) or type(exc).__name__,
+                    },
+                    expected_statuses={"AWAITING_RECOVERY"},
+                )
+
+    async def _close_issue_after_confirmation(self, task_id: str) -> None:
+        lock = self._task_locks.setdefault(task_id, asyncio.Lock())
+        async with lock:
+            task = self.store.get(task_id)
+            if not task or task.get("status") != "CLOSING_ISSUE":
+                return
+            try:
+                issue_number = str(task.get("issue_number", "")).strip()
+                if not issue_number:
+                    raise CNBAPIError("任务没有关联的 CNB Issue 编号。")
+                client = self._client(str(task.get("repository", "")))
+                issue = await asyncio.to_thread(client.get_issue, issue_number)
+                state = self._issue_state(issue)
+                if state == "open":
+                    await asyncio.to_thread(client.close_issue, issue_number)
+                    # A PATCH can succeed while its response is lost or stale.
+                    # Verify the canonical Issue state before completing the task.
+                    issue = await asyncio.to_thread(client.get_issue, issue_number)
+                    state = self._issue_state(issue)
+                if state != "closed":
+                    raise CNBAPIError("CNB Issue 关闭后仍显示为打开状态。")
+                await self._finish(
+                    task,
+                    "DONE",
+                    "已确认恢复，CNB Issue 已关闭。",
+                    extra_fields={
+                        "issue_state": "closed",
+                        "last_issue_error": "",
+                        "issue_close_attempts": int(task.get("issue_close_attempts", 0)),
+                    },
+                )
+            except Exception as exc:
+                attempts = int(task.get("issue_close_attempts", 0)) + 1
+                delay = min(5 * (2 ** min(attempts - 1, 6)), 300)
+                log.warning(
+                    "报障 %s 已确认恢复，但关闭 CNB Issue 失败；%s 秒后重试：%s",
+                    task_id,
+                    delay,
+                    exc,
+                )
+                self.store.update(
+                    task_id,
+                    fields={
+                        "issue_state": task.get("issue_state") or "open",
+                        "issue_close_attempts": attempts,
+                        "next_issue_close_at": time.time() + delay,
+                        "last_issue_error": str(exc) or type(exc).__name__,
+                    },
+                    expected_statuses={"CLOSING_ISSUE"},
+                )
+
+    async def confirm_recovery(
+        self,
+        task_id: str,
+        user_id: str,
+        platform_name: str,
+        bot_id: str,
+        group_id: str,
+    ) -> tuple[bool, str]:
+        task = self.store.get(task_id)
+        if not task:
+            return False, "没有找到这个报障编号。"
+        if (
+            task["user_id"] != str(user_id)
+            or task["platform_name"] != platform_name
+            or task["bot_id"] != bot_id
+            or task["group_id"] != group_id
+        ):
+            return False, "只有原群中的报障发起用户能确认恢复。"
+
+        lock = self._task_locks.setdefault(task_id, asyncio.Lock())
+        async with lock:
+            task = self.store.get(task_id) or task
+            eligible = task.get("status") == "AWAITING_RECOVERY" or (
+                task.get("status") == "DONE" and bool(task.get("issue_number"))
             )
+            if eligible:
+                now = time.time()
+                task = self.store.update(
+                    task_id,
+                    status="CLOSING_ISSUE",
+                    fields={
+                        "recovery_confirmed_at": now,
+                        "issue_close_attempts": 0,
+                        "next_issue_close_at": now,
+                        "last_issue_error": "",
+                    },
+                    expected_statuses={str(task.get("status"))},
+                ) or task
+            elif task.get("status") not in {"CLOSING_ISSUE", "DONE"}:
+                return False, "NPC 分析转发完成后，才能确认恢复并关闭 Issue。"
+
+        if task.get("status") == "CLOSING_ISSUE":
+            await self._close_issue_after_confirmation(task_id)
+            latest = self.store.get(task_id) or task
+            if latest.get("status") == "DONE":
+                return True, "已确认恢复，CNB Issue 已关闭。"
+            return True, "已记录恢复确认，正在关闭 CNB Issue；发送 /debug status 可刷新进度。"
+        if task.get("status") == "DONE" and task.get("issue_state") == "closed":
+            return True, "该报障已完成，CNB Issue 已关闭。"
+        return False, "该报障尚未进入恢复确认阶段。"
 
     def _delivery_send_timeout(self) -> float:
         try:

@@ -15,7 +15,12 @@ from astrbot.api.star import Context, Star, StarTools, register
 from .jobs import ReportJobs, STATUS_LABELS
 from .storage import TaskStore
 
-_HELP = "/debug：提交 ZIP 日志\n/debug status：查看自己的报障状态\n/debug cancel：取消自己的报障"
+_HELP = (
+    "/debug：提交 ZIP 日志\n"
+    "/debug status：刷新并查看完整报障状态\n"
+    "/debug resolve：确认恢复并关闭 CNB Issue\n"
+    "/debug cancel：取消自己的报障"
+)
 
 
 def _component_type(component: Any) -> str:
@@ -84,7 +89,7 @@ class CNBReportPlugin(Star):
     @filter.command("debug")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def debug(self, event: AstrMessageEvent, action: str = ""):
-        """提交 ZIP 日志；status 查询，cancel 取消。无需 @ 或报障编号。"""
+        """提交 ZIP 日志；status 刷新，resolve 确认恢复，cancel 取消。"""
         scope = _event_scope(event)
         if not scope:
             return
@@ -97,18 +102,24 @@ class CNBReportPlugin(Star):
             response = self._start_report(scope, str(event.unified_msg_origin))
         elif action in {"status", "状态"}:
             task = self.store.find_current(*scope)
-            if task and task["status"] == "WAITING_NPC":
-                await self.jobs.poll_npc_now(task["id"])
+            if task:
+                task = await self.jobs.refresh_task(task["id"]) or task
                 task = self.store.get(task["id"]) or task
-                if task["status"] == "WAITING_NPC":
-                    if task.get("last_poll_error"):
-                        response = "刚刚查询 CNB 评论失败，插件会自动重试。\n" + self._format_status(task)
-                    else:
-                        response = "已立即查询 CNB 评论，暂未发现符合条件的 NPC 最终回复。\n" + self._format_status(task)
+                if task["status"] == "WAITING_NPC" and task.get("last_poll_error"):
+                    response = "已刷新完整报障状态；刚刚查询 CNB 评论失败，插件会自动重试。\n" + self._format_status(task)
                 else:
-                    response = self._format_status(task)
+                    response = "已刷新完整报障状态。\n" + self._format_status(task)
             else:
-                response = self._format_status(task) if task else "你在此群还没有报障，请发送 /debug 开始。"
+                response = "你在此群还没有报障，请发送 /debug 开始。"
+        elif action in {"resolve", "resolved", "恢复", "已恢复"}:
+            task = self.store.find_current(*scope)
+            if task:
+                platform_name, bot_id, group_id, sender_id = scope
+                _, response = await self.jobs.confirm_recovery(
+                    task["id"], sender_id, platform_name, bot_id, group_id
+                )
+            else:
+                response = "你在此群还没有报障。"
         elif action in {"cancel", "取消"}:
             task = self.store.find_current(*scope)
             if task:
@@ -202,8 +213,15 @@ class CNBReportPlugin(Star):
         lines = [f"状态：{label}"]
         if task.get("issue_url"):
             lines.append(f"Issue：{task['issue_url']}")
+            issue_state = task.get("issue_state")
+            if issue_state:
+                lines.append(f"Issue 状态：{'已关闭' if issue_state == 'closed' else '打开'}")
         if task.get("last_error"):
             lines.append(f"说明：{task['last_error']}")
+        if task.get("status") == "AWAITING_RECOVERY":
+            lines.append("确认按建议处理后发送 /debug resolve，插件会关闭此 Issue。")
+        if task.get("status") in {"AWAITING_RECOVERY", "CLOSING_ISSUE"} and task.get("last_issue_error"):
+            lines.append(f"Issue 状态同步遇到问题，插件会自动重试：{task['last_issue_error']}")
         if task.get("status") == "DELIVERING" and task.get("last_delivery_error"):
             lines.append(
                 f"最近一次转发发送失败：{task['last_delivery_error']}；插件会自动重试。"

@@ -1,9 +1,9 @@
 name: astrbot_plugin_cnb_bot
 display_name: CNB 报障助手
-desc: 通过 /debug 提交 ZIP 日志，创建 CNB Issue 并转发已验证的 NPC 分析结果。
+desc: 通过 /debug 提交日志，创建 CNB Issue 并转发已验证的 NPC 分析结果。
 version: 0.2.0
-author: harco
-repo: ""
+author: harcochen
+repo: "https://github.com/HarcoChen/astrbot_plugin_cnb_bot"
 astrbot_version: ">=4.16,<5"
 support_platforms:
   - aiocqhttp
