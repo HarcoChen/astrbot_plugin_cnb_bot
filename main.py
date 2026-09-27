@@ -366,7 +366,7 @@ class CNBReportPlugin(Star):
         if task.get("status") == "AWAITING_RECOVERY":
             if task.get("analysis_summary"):
                 lines.append(f"结论：{task['analysis_summary']}")
-            lines.append("处理并确认恢复后发送 /debug resolve。")
+            lines.append("请在 5 分钟内发送 /debug resolve；超时后 CNB Issue 会自动关闭。")
         if task.get("status") in {"AWAITING_RECOVERY", "CLOSING_ISSUE"} and task.get("last_issue_error"):
             lines.append(f"Issue 状态同步遇到问题，插件会自动重试：{task['last_issue_error']}")
         if task.get("status") == "DELIVERING" and task.get("last_delivery_error"):

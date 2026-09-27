@@ -15,6 +15,8 @@ from .cnb_client import CNBAPIError, CNBClient, CNBNetworkError
 from .qq_files import FileInputError, stage_log_file
 from .storage import ACTIVE_STATUSES, TaskStore, TERMINAL_STATUSES
 
+RECOVERY_CONFIRM_TIMEOUT_SECONDS = 5 * 60
+
 STATUS_LABELS = {
     "WAITING_LOG": "等待日志上传",
     "PREPARING_LOG": "正在准备上传日志",
@@ -262,11 +264,12 @@ class ReportJobs:
                     expected_statuses={"TRIGGERING_NPC"},
                 )
             elif status == "AWAITING_RECOVERY":
-                self.store.update(
-                    task["id"],
-                    fields={"next_issue_check_at": now},
-                    expected_statuses={"AWAITING_RECOVERY"},
-                )
+                fields = {"next_issue_check_at": now}
+                if not self._recovery_deadline(task):
+                    # Existing tasks created before the timeout feature receive a
+                    # full grace period from the first plugin startup.
+                    fields["recovery_deadline"] = now + RECOVERY_CONFIRM_TIMEOUT_SECONDS
+                self.store.update(task["id"], fields=fields, expected_statuses={"AWAITING_RECOVERY"})
             elif status == "CLOSING_ISSUE":
                 self.store.update(
                     task["id"],
@@ -323,7 +326,10 @@ class ReportJobs:
                         await self._reconcile_trigger(task)
                 elif status == "DELIVERING" and float(task.get("next_delivery_at", 0)) <= now:
                     await self._deliver(task)
-                elif status == "AWAITING_RECOVERY" and float(task.get("next_issue_check_at", 0)) <= now:
+                elif status == "AWAITING_RECOVERY" and (
+                    self._recovery_deadline(task) <= now
+                    or float(task.get("next_issue_check_at", 0)) <= now
+                ):
                     await self._sync_issue_lifecycle(str(task["id"]))
                 elif status == "CLOSING_ISSUE" and float(task.get("next_issue_close_at", 0)) <= now:
                     await self._close_issue_after_confirmation(str(task["id"]))
@@ -1483,6 +1489,7 @@ class ReportJobs:
 
     async def _await_recovery_confirmation(self, task: dict[str, Any], delivered_parts: int) -> None:
         summary = str(task.get("analysis_summary") or "NPC 已返回分析，详见转发。")
+        recovery_deadline = time.time() + RECOVERY_CONFIRM_TIMEOUT_SECONDS
         await self._finish(
             task,
             "AWAITING_RECOVERY",
@@ -1492,10 +1499,14 @@ class ReportJobs:
                 "delivery_parts": [],
                 "analysis_body": "",
                 "issue_state": task.get("issue_state") or "open",
+                "recovery_deadline": recovery_deadline,
                 "next_issue_check_at": time.time() + self._issue_check_interval(),
                 "last_issue_error": "",
             },
-            notify_message=f"结论：{summary}\n处理并确认恢复后发送 /debug resolve。",
+            notify_message=(
+                f"结论：{summary}\n处理并确认恢复后，请在 5 分钟内发送 /debug resolve；"
+                "超时后 CNB Issue 会自动关闭。"
+            ),
         )
 
     def _issue_check_interval(self) -> int:
@@ -1506,6 +1517,13 @@ class ReportJobs:
         return max(5, min(seconds, 300))
 
     @staticmethod
+    def _recovery_deadline(task: dict[str, Any]) -> float:
+        try:
+            return float(task.get("recovery_deadline", 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
     def _issue_state(issue: dict[str, Any]) -> str:
         state = str(issue.get("state", "")).strip().lower()
         if state not in {"open", "closed"}:
@@ -1514,48 +1532,61 @@ class ReportJobs:
 
     async def _sync_issue_lifecycle(self, task_id: str) -> None:
         lock = self._task_locks.setdefault(task_id, asyncio.Lock())
+        close_due_to_timeout = False
         async with lock:
             task = self.store.get(task_id)
             if not task or task.get("status") != "AWAITING_RECOVERY":
                 return
-            try:
-                client = self._client(str(task.get("repository", "")))
-                issue = await asyncio.to_thread(
-                    client.get_issue, str(task.get("issue_number", ""))
+            now = time.time()
+            recovery_deadline = self._recovery_deadline(task)
+            if recovery_deadline <= 0:
+                recovery_deadline = now + RECOVERY_CONFIRM_TIMEOUT_SECONDS
+                self.store.update(
+                    task_id,
+                    fields={"recovery_deadline": recovery_deadline},
+                    expected_statuses={"AWAITING_RECOVERY"},
                 )
-                state = self._issue_state(issue)
-                if state == "closed":
-                    # An external close is not proof that the reporting user
-                    # confirmed recovery. Keep awaiting /debug resolve.
+            if recovery_deadline <= now:
+                updated = self.store.update(
+                    task_id,
+                    status="CLOSING_ISSUE",
+                    fields={
+                        "close_reason": "timeout",
+                        "issue_close_attempts": 0,
+                        "next_issue_close_at": now,
+                        "last_issue_error": "",
+                    },
+                    expected_statuses={"AWAITING_RECOVERY"},
+                )
+                close_due_to_timeout = bool(updated and updated.get("status") == "CLOSING_ISSUE")
+            else:
+                try:
+                    client = self._client(str(task.get("repository", "")))
+                    issue = await asyncio.to_thread(
+                        client.get_issue, str(task.get("issue_number", ""))
+                    )
+                    state = self._issue_state(issue)
                     self.store.update(
                         task_id,
                         fields={
-                            "issue_state": "closed",
+                            "issue_state": state,
                             "next_issue_check_at": time.time() + self._issue_check_interval(),
                             "last_issue_error": "",
                         },
                         expected_statuses={"AWAITING_RECOVERY"},
                     )
-                    return
-                self.store.update(
-                    task_id,
-                    fields={
-                        "issue_state": "open",
-                        "next_issue_check_at": time.time() + self._issue_check_interval(),
-                        "last_issue_error": "",
-                    },
-                    expected_statuses={"AWAITING_RECOVERY"},
-                )
-            except Exception as exc:
-                log.warning("报障 %s 检查 CNB Issue 状态失败：%s", task_id, exc)
-                self.store.update(
-                    task_id,
-                    fields={
-                        "next_issue_check_at": time.time() + self._issue_check_interval(),
-                        "last_issue_error": str(exc) or type(exc).__name__,
-                    },
-                    expected_statuses={"AWAITING_RECOVERY"},
-                )
+                except Exception as exc:
+                    log.warning("报障 %s 检查 CNB Issue 状态失败：%s", task_id, exc)
+                    self.store.update(
+                        task_id,
+                        fields={
+                            "next_issue_check_at": time.time() + self._issue_check_interval(),
+                            "last_issue_error": str(exc) or type(exc).__name__,
+                        },
+                        expected_statuses={"AWAITING_RECOVERY"},
+                    )
+        if close_due_to_timeout:
+            await self._close_issue_after_confirmation(task_id)
 
     async def _close_issue_after_confirmation(self, task_id: str) -> None:
         lock = self._task_locks.setdefault(task_id, asyncio.Lock())
@@ -1563,6 +1594,7 @@ class ReportJobs:
             task = self.store.get(task_id)
             if not task or task.get("status") != "CLOSING_ISSUE":
                 return
+            close_reason = str(task.get("close_reason", "user"))
             try:
                 issue_number = str(task.get("issue_number", "")).strip()
                 if not issue_number:
@@ -1581,19 +1613,29 @@ class ReportJobs:
                 await self._finish(
                     task,
                     "DONE",
-                    "已确认恢复，CNB Issue 已关闭。",
+                    (
+                        "5 分钟内未收到 /debug resolve，报障已自动结束，CNB Issue 已关闭。"
+                        if close_reason == "timeout"
+                        else "已确认恢复，CNB Issue 已关闭。"
+                    ),
                     extra_fields={
                         "issue_state": "closed",
                         "last_issue_error": "",
                         "issue_close_attempts": int(task.get("issue_close_attempts", 0)),
                     },
+                    notify_message=(
+                        "5 分钟内未收到 /debug resolve，报障已自动结束，CNB Issue 已关闭。"
+                        if close_reason == "timeout"
+                        else "已确认恢复，CNB Issue 已关闭。"
+                    ),
                 )
             except Exception as exc:
                 attempts = int(task.get("issue_close_attempts", 0)) + 1
                 delay = min(5 * (2 ** min(attempts - 1, 6)), 300)
                 log.warning(
-                    "报障 %s 已确认恢复，但关闭 CNB Issue 失败；%s 秒后重试：%s",
+                    "报障 %s %s，但关闭 CNB Issue 失败；%s 秒后重试：%s",
                     task_id,
+                    "自动结束超时" if close_reason == "timeout" else "已确认恢复",
                     delay,
                     exc,
                 )
@@ -1628,6 +1670,7 @@ class ReportJobs:
             return False, "只有发起报障的用户能确认恢复。"
 
         lock = self._task_locks.setdefault(task_id, asyncio.Lock())
+        close_reason = str(task.get("close_reason", ""))
         async with lock:
             task = self.store.get(task_id) or task
             if task.get("status") == "DONE":
@@ -1635,25 +1678,40 @@ class ReportJobs:
             eligible = task.get("status") == "AWAITING_RECOVERY"
             if eligible:
                 now = time.time()
+                recovery_deadline = self._recovery_deadline(task)
+                if recovery_deadline <= 0:
+                    recovery_deadline = now + RECOVERY_CONFIRM_TIMEOUT_SECONDS
+                close_reason = "timeout" if recovery_deadline <= now else "user"
+                close_fields = {
+                    "close_reason": close_reason,
+                    "issue_close_attempts": 0,
+                    "next_issue_close_at": now,
+                    "last_issue_error": "",
+                }
+                if close_reason == "timeout":
+                    close_fields["recovery_deadline"] = recovery_deadline
+                else:
+                    close_fields["recovery_confirmed_at"] = now
                 task = self.store.update(
                     task_id,
                     status="CLOSING_ISSUE",
-                    fields={
-                        "recovery_confirmed_at": now,
-                        "issue_close_attempts": 0,
-                        "next_issue_close_at": now,
-                        "last_issue_error": "",
-                    },
+                    fields=close_fields,
                     expected_statuses={str(task.get("status"))},
                 ) or task
             elif task.get("status") not in {"CLOSING_ISSUE", "DONE"}:
                 return False, "NPC 分析转发完成后，才能确认恢复并关闭 Issue。"
+            else:
+                close_reason = str(task.get("close_reason", "user"))
 
         if task.get("status") == "CLOSING_ISSUE":
             await self._close_issue_after_confirmation(task_id)
             latest = self.store.get(task_id) or task
             if latest.get("status") == "DONE":
+                if close_reason == "timeout":
+                    return True, "超过 5 分钟未收到 /debug resolve，CNB Issue 已自动关闭。"
                 return True, "已确认恢复，CNB Issue 已关闭。"
+            if close_reason == "timeout":
+                return True, "超过 5 分钟未收到 /debug resolve，插件正在自动关闭 CNB Issue；发送 /debug status 查看进度。"
             return True, "已记录恢复确认，正在关闭 CNB Issue；发送 /debug status 可刷新进度。"
         if task.get("status") == "DONE" and task.get("issue_state") == "closed":
             return True, "该报障已完成，CNB Issue 已关闭。"
