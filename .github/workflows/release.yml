@@ -1,0 +1,39 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Generate changelog and publish release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out full history and tags
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Generate changelog and plugin archive
+        run: python scripts/release.py "${GITHUB_REF_NAME}" --output-dir dist
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG_NAME" \
+            --title "CNB 报障助手 $TAG_NAME" \
+            --notes-file "dist/CHANGELOG-$TAG_NAME.md" \
+            "dist/astrbot_plugin_cnb_bot-$TAG_NAME.zip" \
+            "dist/CHANGELOG-$TAG_NAME.md" \
+            "dist/SHA256SUMS.txt"
