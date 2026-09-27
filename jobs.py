@@ -13,25 +13,46 @@ from astrbot.api import logger as log
 
 from .cnb_client import CNBAPIError, CNBClient, CNBNetworkError
 from .qq_files import FileInputError, stage_log_file
+from .settings import (
+    analysis_wait_seconds,
+    assistant_name,
+    format_bytes,
+    format_duration,
+    max_log_file_bytes,
+    recovery_confirm_seconds,
+)
 from .storage import ACTIVE_STATUSES, TaskStore, TERMINAL_STATUSES
 
-RECOVERY_CONFIRM_TIMEOUT_SECONDS = 5 * 60
-
+# User-facing labels; the three submission steps read as one to the reporter.
 STATUS_LABELS = {
-    "WAITING_LOG": "等待日志上传",
-    "PREPARING_LOG": "正在准备上传日志",
-    "CREATING_ISSUE": "正在上传日志并创建 CNB Issue",
-    "TRIGGERING_NPC": "正在请求 NPC 分析",
-    "WAITING_NPC": "等待 NPC 最终分析",
-    "DELIVERING": "正在发送 NPC 分析转发",
-    "AWAITING_RECOVERY": "等待用户确认恢复",
-    "CLOSING_ISSUE": "正在关闭 CNB Issue",
+    "WAITING_LOG": "等待上传日志",
+    "PREPARING_LOG": "正在提交日志",
+    "CREATING_ISSUE": "正在提交日志",
+    "TRIGGERING_NPC": "正在提交日志",
+    "WAITING_NPC": "正在分析",
+    "DELIVERING": "正在发送分析结果",
+    "AWAITING_RECOVERY": "等待你确认是否解决",
+    "CLOSING_ISSUE": "正在结束报障",
     "DONE": "已完成",
     "EXPIRED": "等待日志超时",
     "CANCELLED": "已取消",
     "FAILED": "处理失败",
-    "UNCERTAIN": "需要核对 CNB 外部状态",
+    "UNCERTAIN": "正在核对提交结果",
 }
+
+
+EXPIRED_MESSAGE = "等待日志超时，报障已结束；需要时请重新发送 /debug。"
+
+
+def status_label(task: dict[str, Any]) -> str:
+    status = str(task.get("status", ""))
+    if status == "UNCERTAIN" and task.get("uncertain_kind") == "issue_creation":
+        return "需要管理员核对"
+    return STATUS_LABELS.get(status, status)
+
+
+def admin_trace_hint(task: dict[str, Any]) -> str:
+    return f"请管理员在 CNB 仓库搜索追踪编号 {task['id']} 核对；插件不会重复创建。"
 
 
 def _api_error_is_ambiguous(error: CNBAPIError) -> bool:
@@ -91,7 +112,7 @@ def _format_analysis(body: str) -> str:
     sentence_end = re.search(r"[。！？!?](?:[”’」』）】]*)", first_line)
     summary = first_line[: sentence_end.end()] if sentence_end else first_line
     if not summary:
-        summary = "NPC 已返回分析，详见下方。"
+        summary = "已返回分析，详见下方。"
     return f"【一句话描述】\n{summary}\n\n【详细分析】\n{body.strip()}"
 
 
@@ -105,7 +126,7 @@ def _analysis_summary(body: str) -> str:
     )
     summary = re.sub(r"\s+", " ", match.group(1)).strip() if match else ""
     if not summary:
-        return "NPC 已返回分析，详见转发。"
+        return "已返回分析，详见合并转发。"
     sentence_end = re.search(r"[。！？!?](?:[”’」』）】]*)", summary)
     return summary[: sentence_end.end()].strip() if sentence_end else summary
 
@@ -180,7 +201,7 @@ class ReportJobs:
         for task in self.store.list_statuses(ACTIVE_STATUSES):
             status = task["status"]
             if status == "WAITING_LOG" and float(task["deadline"]) <= now:
-                await self._finish(task, "EXPIRED", "等待日志上传超时。")
+                await self._finish(task, "EXPIRED", EXPIRED_MESSAGE)
             elif status == "WAITING_NPC":
                 # A reload may happen just after an NPC reply was posted. Do not
                 # make the user wait out the persisted exponential backoff.
@@ -211,17 +232,14 @@ class ReportJobs:
                     self.store.update(
                         task["id"],
                         status="WAITING_LOG",
-                        fields={"last_error": "上次准备日志上传时被中断，请重新上传。"},
+                        fields={"last_error": "插件重启打断了日志提交，请重新上传。"},
                         expected_statuses={"PREPARING_LOG"},
                     )
-                    await self._notify(
-                        task,
-                        f"报障 {task['id']} 的日志上传准备在重启时中断，请在原等待时限内重新上传。",
-                    )
+                    await self._notify(task, self._reupload_notice(task))
                 else:
                     self._cleanup_temp_files(str(task["id"]))
                     self._cleanup_prepared_candidates(str(task["id"]))
-                    await self._finish(task, "EXPIRED", "重启后日志上传等待时间已到。")
+                    await self._finish(task, "EXPIRED", EXPIRED_MESSAGE)
             elif status == "CREATING_ISSUE":
                 phase = task.get("external_phase", "prepared")
                 if phase in {"prepared", "asset_upload", "asset_uploaded"} and task.get("prepared_path"):
@@ -234,7 +252,7 @@ class ReportJobs:
                     status="UNCERTAIN",
                     fields={
                         "uncertain_kind": "issue_creation",
-                        "last_error": "插件在创建 Issue 请求期间重启；不会自动重复创建。",
+                        "last_error": "插件在创建 Issue 时重启，无法确认 Issue 是否已创建。",
                         "description": "",
                         "context_snapshot": "",
                         "prepared_path": "",
@@ -248,17 +266,14 @@ class ReportJobs:
                     Path(task["prepared_path"]).unlink(missing_ok=True)
                 current = self.store.get(task["id"])
                 if current and current["status"] == "UNCERTAIN":
-                    await self._notify(
-                        current,
-                        f"报障 {task['id']} 的 CNB Issue 创建结果需要核对。为避免重复 Issue，插件没有重试；请在目标仓库按报障编号搜索。",
-                    )
+                    await self._notify(current, self._issue_uncertain_notice(current))
             elif status == "TRIGGERING_NPC":
                 self.store.update(
                     task["id"],
                     status="UNCERTAIN",
                     fields={
                         "uncertain_kind": "trigger_comment",
-                        "last_error": "插件在提交 NPC 触发评论期间重启，正在核对评论是否已创建。",
+                        "last_error": "插件重启，正在确认分析请求是否已提交。",
                         "next_poll_at": now,
                     },
                     expected_statuses={"TRIGGERING_NPC"},
@@ -268,7 +283,7 @@ class ReportJobs:
                 if not self._recovery_deadline(task):
                     # Existing tasks created before the timeout feature receive a
                     # full grace period from the first plugin startup.
-                    fields["recovery_deadline"] = now + RECOVERY_CONFIRM_TIMEOUT_SECONDS
+                    fields["recovery_deadline"] = now + self._recovery_timeout()
                 self.store.update(task["id"], fields=fields, expected_statuses={"AWAITING_RECOVERY"})
             elif status == "CLOSING_ISSUE":
                 self.store.update(
@@ -305,14 +320,10 @@ class ReportJobs:
             try:
                 status = task["status"]
                 if status == "WAITING_LOG" and float(task["deadline"]) <= now:
-                    await self._finish(task, "EXPIRED", "等待日志上传超时。")
+                    await self._finish(task, "EXPIRED", EXPIRED_MESSAGE)
                 elif status == "WAITING_NPC":
                     if float(task.get("analysis_deadline", 0)) <= now:
-                        await self._finish(
-                            task,
-                            "FAILED",
-                            "等待 NPC 最终回复超时；已创建的 Issue 保留。",
-                        )
+                        await self._finish(task, "FAILED", self._analysis_timeout_message(task))
                     elif float(task.get("next_poll_at", 0)) <= now:
                         await self._poll_npc(task)
                 elif status == "UNCERTAIN" and task.get("uncertain_kind") == "trigger_comment":
@@ -320,7 +331,8 @@ class ReportJobs:
                         await self._finish(
                             task,
                             "FAILED",
-                            "无法确认 NPC 触发评论是否已创建；请检查 Issue 后人工处理。",
+                            "无法确认分析请求是否已提交，报障已结束。"
+                            f"请查看 Issue 或联系管理员：{task.get('issue_url', '')}",
                         )
                     elif float(task.get("next_poll_at", 0)) <= now:
                         await self._reconcile_trigger(task)
@@ -358,7 +370,7 @@ class ReportJobs:
 
             if status == "WAITING_LOG":
                 if float(task.get("deadline", 0)) <= time.time():
-                    await self._finish(task, "EXPIRED", "等待日志上传超时。")
+                    await self._finish(task, "EXPIRED", EXPIRED_MESSAGE)
                     continue
                 return task
             if status == "PREPARING_LOG":
@@ -377,11 +389,7 @@ class ReportJobs:
                 await self._refresh_triggering_npc(task_id)
             elif status == "WAITING_NPC":
                 if float(task.get("analysis_deadline", 0)) <= time.time():
-                    await self._finish(
-                        task,
-                        "FAILED",
-                        "等待 NPC 最终回复超时；已创建的 Issue 保留。",
-                    )
+                    await self._finish(task, "FAILED", self._analysis_timeout_message(task))
                 else:
                     await self._poll_npc(task)
             elif status == "UNCERTAIN":
@@ -443,19 +451,16 @@ class ReportJobs:
             self._cleanup_temp_files(task_id)
             self._cleanup_prepared_candidates(task_id)
             if float(task.get("deadline", 0)) <= now:
-                await self._finish(task, "EXPIRED", "等待日志上传超时。")
+                await self._finish(task, "EXPIRED", EXPIRED_MESSAGE)
                 return
             updated = self.store.update(
                 task_id,
                 status="WAITING_LOG",
-                fields={"last_error": "上次准备日志上传时被中断，请重新上传。"},
+                fields={"last_error": "插件重启打断了日志提交，请重新上传。"},
                 expected_statuses={"PREPARING_LOG"},
             )
             if updated and updated.get("status") == "WAITING_LOG":
-                await self._notify(
-                    updated,
-                    f"报障 {task_id} 的日志上传准备已中断，请在原等待时限内重新上传。",
-                )
+                await self._notify(updated, self._reupload_notice(updated))
 
     async def _refresh_triggering_npc(self, task_id: str) -> None:
         lock = self._task_locks.setdefault(task_id, asyncio.Lock())
@@ -469,7 +474,7 @@ class ReportJobs:
                 status="UNCERTAIN",
                 fields={
                     "uncertain_kind": "trigger_comment",
-                    "last_error": "正在核对 NPC 触发评论是否已创建；不会重复提交。",
+                    "last_error": "正在确认分析请求是否已提交。",
                     "next_poll_at": now,
                     "poll_attempts": 0,
                 },
@@ -490,7 +495,7 @@ class ReportJobs:
                 status="UNCERTAIN",
                 fields={
                     "uncertain_kind": "issue_creation",
-                    "last_error": "插件无法确认 Issue 创建请求是否成功；为避免重复，没有再次创建。",
+                    "last_error": "无法确认 Issue 是否已创建。",
                     "description": "",
                     "context_snapshot": "",
                     "prepared_path": "",
@@ -504,17 +509,14 @@ class ReportJobs:
             path = current.get("prepared_path")
             if path:
                 Path(path).unlink(missing_ok=True)
-            await self._notify(
-                updated,
-                f"报障 {task_id} 的 Issue 创建结果需要核对。为避免重复 Issue，请在目标仓库按报障编号搜索。",
-            )
+            await self._notify(updated, self._issue_uncertain_notice(updated))
 
     async def accept_attachment(self, task_id: str, component) -> tuple[bool, str]:
         lock = self._task_locks.setdefault(task_id, asyncio.Lock())
         async with lock:
             task = self.store.get(task_id)
             if not task or task["status"] != "PREPARING_LOG":
-                return False, "这份日志已处理，或对应报障任务已失效。"
+                return False, "这份日志已在处理中，或报障已结束。"
             staged_destination = self.temp_dir / f"{task_id}.upload"
             prepared_path: Path | None = None
             self._cleanup_temp_files(task_id)
@@ -525,7 +527,7 @@ class ReportJobs:
                     stage_log_file,
                     component,
                     staged_destination,
-                    int(self.config.get("max_archive_bytes", 20 * 1024 * 1024)),
+                    max_log_file_bytes(self.config),
                     sorted(self._config_values(self.config.get("file_url_host_allowlist", []))),
                 )
                 source_suffix = Path(source_name).suffix.lower()
@@ -534,7 +536,7 @@ class ReportJobs:
                 current = self.store.get(task_id)
                 if not current or current["status"] != "PREPARING_LOG":
                     prepared_path.unlink(missing_ok=True)
-                    return False, "报障任务已取消。"
+                    return False, "报障已取消。"
                 staged_path.replace(prepared_path)
                 summary_json = {
                     "file_bytes": file_bytes,
@@ -557,7 +559,7 @@ class ReportJobs:
                 current = self.store.get(task_id)
                 if not current or current["status"] != "CREATING_ISSUE":
                     prepared_path.unlink(missing_ok=True)
-                    return False, "报障任务已取消。"
+                    return False, "报障已取消。"
             except FileInputError as exc:
                 self._cleanup_temp_files(task_id)
                 if prepared_path:
@@ -581,41 +583,43 @@ class ReportJobs:
                     self.store.update(
                         task_id,
                         status="WAITING_LOG",
-                        fields={"last_error": "准备日志附件时发生异常，请重新上传。"},
+                        fields={"last_error": "读取日志文件时出错，请重新上传。"},
                         expected_statuses={"PREPARING_LOG"},
                     )
-                return False, "准备日志附件时发生异常，请检查插件日志后重新上传。"
+                return False, "读取日志文件时出错，请重新上传；如持续失败请联系管理员。"
             finally:
                 self._cleanup_temp_files(task_id)
 
         await self._create_issue_from_prepared(task_id, notify_issue_created=False)
         updated = self.store.get(task_id)
         if updated and updated["status"] == "WAITING_NPC":
-            return True, f"日志已上传，NPC 正在分析：{updated.get('issue_url', '')}"
+            return True, self._submitted_notice(updated)
         if updated and updated["status"] == "UNCERTAIN":
-            return False, updated.get("last_error", "CNB 请求结果需要核对。")
+            if updated.get("uncertain_kind") == "issue_creation":
+                return False, self._issue_uncertain_notice(updated)
+            return False, self._trigger_uncertain_notice(updated)
         if updated and updated["status"] == "FAILED":
-            return False, updated.get("last_error", "CNB 流程失败。")
-        return True, "日志已处理。"
+            return False, updated.get("last_error") or "提交失败，请稍后重新发送 /debug 再试。"
+        return True, "日志已提交，发送 /debug status 可查看进度。"
 
     async def append_issue_comment(self, task_id: str, text: str) -> tuple[bool, str]:
         """Post an explicitly mentioned user's follow-up as an Issue comment."""
         body_text = str(text or "").strip()
         if not body_text:
-            return False, "补充说明不能为空。"
+            return False, "补充信息不能为空。"
         if len(body_text) > 4000:
-            return False, "单条补充说明不能超过 4000 个字符。"
+            return False, "单条补充信息不能超过 4000 个字符，请分几条发送。"
 
         lock = self._task_locks.setdefault(task_id, asyncio.Lock())
         async with lock:
             task = self.store.get(task_id)
             if not task or task.get("status") not in ACTIVE_STATUSES:
-                return False, "这条报障已结束，不能再追加 Issue 评论。"
+                return False, "报障已结束，这条补充信息没有提交；需要时请重新发送 /debug。"
             if task.get("status") == "CLOSING_ISSUE":
-                return False, "此报障正在关闭 Issue，暂时不能追加评论。"
+                return False, "报障正在结束，这条补充信息没有提交。"
             issue_number = str(task.get("issue_number") or "")
             if not issue_number:
-                return False, "当前 Issue 尚未创建；创建后再 @机器人发送补充说明。"
+                return False, f"Issue 还没创建好，请稍后再{self._supplement_how(task)}发送补充信息。"
 
             comment = f"报障补充说明：\n\n{body_text}"
             try:
@@ -623,7 +627,7 @@ class ReportJobs:
                 await asyncio.to_thread(client.create_comment, issue_number, comment)
             except CNBNetworkError:
                 log.warning("报障 %s 的补充评论请求结果不确定。", task_id)
-                return False, "CNB 评论请求结果不确定，请先检查 Issue 评论；插件没有自动重试。"
+                return False, self._comment_uncertain_notice(task)
             except CNBAPIError as exc:
                 log.warning(
                     "报障 %s 的补充评论请求返回 HTTP %s。",
@@ -631,14 +635,19 @@ class ReportJobs:
                     exc.status_code,
                 )
                 if _api_error_is_ambiguous(exc):
-                    return False, "CNB 评论请求结果不确定，请先检查 Issue 评论；插件没有自动重试。"
-                return False, f"CNB 拒绝了这条评论：{exc}"
+                    return False, self._comment_uncertain_notice(task)
+                return False, f"补充信息提交失败：{exc}"
             except Exception:
                 log.exception("发送报障 %s 的补充 Issue 评论失败。", task_id)
-                return False, "发送补充评论时发生异常，请检查插件日志。"
+                return False, "补充信息提交失败，请稍后再发一次；如持续失败请联系管理员。"
 
         log.info("报障 %s 已追加一条用户补充评论。", task_id)
-        return True, "补充说明已发送到 CNB Issue 评论。"
+        if task.get("status") in {"WAITING_NPC", "AWAITING_RECOVERY"}:
+            return True, (
+                "已补充到 Issue。\n"
+                f"补充完后发送 /debug analyze，让{self._assistant()}结合新信息重新分析。"
+            )
+        return True, "已补充到 Issue。"
 
     async def request_npc_analysis(
         self,
@@ -651,14 +660,14 @@ class ReportJobs:
         """Ask the configured NPC to re-analyze the Issue and its comments."""
         task = self.store.get(task_id)
         if not task:
-            return False, "没有找到这条报障。"
+            return False, "没有找到这次报障。"
         if (
             task.get("user_id") != str(user_id)
             or task.get("platform_name") != platform_name
             or task.get("bot_id") != bot_id
             or task.get("group_id") != group_id
         ):
-            return False, "只有发起报障的用户能要求 NPC 重新分析。"
+            return False, "只有发起报障的人可以请求重新分析。"
 
         lock = self._task_locks.setdefault(task_id, asyncio.Lock())
         async with lock:
@@ -666,19 +675,19 @@ class ReportJobs:
             status = str(task.get("status", ""))
             if status not in {"WAITING_NPC", "AWAITING_RECOVERY"}:
                 if status == "UNCERTAIN" and task.get("uncertain_kind") == "trigger_comment":
-                    return False, "NPC 请求状态尚未核实，请先发送 /debug status；核实后再发送 /debug analyze。"
+                    return False, "正在确认上一次分析请求是否已提交，请稍后再试。"
                 if status == "TRIGGERING_NPC":
-                    return False, "NPC 分析请求正在提交，请稍后查询 /debug status。"
+                    return False, "分析请求正在提交，请稍后再试。"
                 if not task.get("issue_number"):
-                    return False, "CNB Issue 尚未创建，暂时不能请求 NPC 分析。"
-                return False, f"当前状态为“{STATUS_LABELS.get(status, status)}”，暂时不能重新分析。"
+                    return False, "Issue 还没创建好，暂时不能重新分析。"
+                return False, f"当前状态为“{status_label(task)}”，暂时不能重新分析。"
 
             issue_number = str(task.get("issue_number") or "")
             if not issue_number:
-                return False, "CNB Issue 尚未创建，暂时不能请求 NPC 分析。"
+                return False, "Issue 还没创建好，暂时不能重新分析。"
             npc_mention = str(self.config.get("npc_mention", "@CodeBuddy")).strip()
             if not npc_mention:
-                return False, "未配置 NPC 提及文本，请联系管理员。"
+                return False, "插件配置不完整（缺少 NPC 提及文本），请联系管理员。"
 
             try:
                 analysis_round = max(1, int(task.get("analysis_round", 1))) + 1
@@ -692,10 +701,7 @@ class ReportJobs:
                 reanalysis=True,
             )
             started_at = time.time()
-            try:
-                analysis_wait = int(self.config.get("analysis_wait_seconds", 1200))
-            except (TypeError, ValueError):
-                analysis_wait = 1200
+            analysis_wait = analysis_wait_seconds(self.config)
 
             changed_fields = {
                 "trigger_body": trigger_body,
@@ -725,7 +731,7 @@ class ReportJobs:
             try:
                 client = self._client(str(task.get("repository", "")))
             except (TypeError, ValueError) as exc:
-                return False, f"CNB 配置无效，无法请求 NPC 分析：{exc}"
+                return False, f"插件配置有误，无法请求重新分析，请联系管理员：{exc}"
             started = self.store.update(
                 task_id,
                 status="TRIGGERING_NPC",
@@ -734,8 +740,7 @@ class ReportJobs:
             )
             if not started or started.get("status") != "TRIGGERING_NPC":
                 latest = started or self.store.get(task_id)
-                latest_status = str((latest or {}).get("status", "未知"))
-                return False, f"报障状态已变为“{STATUS_LABELS.get(latest_status, latest_status)}”，请先查询 /debug status。"
+                return False, f"报障状态已变为“{status_label(latest or {})}”，请发送 /debug status 查看。"
 
             try:
                 comment = await asyncio.to_thread(
@@ -751,7 +756,7 @@ class ReportJobs:
                         fields=previous_fields,
                         expected_statuses={"TRIGGERING_NPC"},
                     )
-                    return False, f"CNB 拒绝了 NPC 分析请求：{exc}"
+                    return False, f"重新分析请求提交失败：{exc}"
                 self.store.update(
                     task_id,
                     status="UNCERTAIN",
@@ -764,7 +769,7 @@ class ReportJobs:
                     expected_statuses={"TRIGGERING_NPC"},
                 )
                 log.warning("报障 %s 的 NPC 重新分析请求结果不确定。", task_id)
-                return False, "NPC 分析请求结果不确定，插件正在核对 Issue 评论，不会重复提交。"
+                return False, self._trigger_uncertain_notice(task)
             except Exception as exc:
                 self.store.update(
                     task_id,
@@ -778,7 +783,7 @@ class ReportJobs:
                     expected_statuses={"TRIGGERING_NPC"},
                 )
                 log.exception("报障 %s 提交 NPC 重新分析请求时发生异常。", task_id)
-                return False, "NPC 分析请求结果不确定，插件正在核对 Issue 评论，不会重复提交。"
+                return False, self._trigger_uncertain_notice(task)
 
             comment_id = str(comment.get("id", "")) if isinstance(comment, dict) else ""
             updated = self.store.update(
@@ -795,14 +800,17 @@ class ReportJobs:
                 expected_statuses={"TRIGGERING_NPC"},
             )
             if not updated or updated.get("status") != "WAITING_NPC":
-                return False, "NPC 请求已发出，但报障状态已变化；请发送 /debug status 核对。"
+                return False, "请求已发出，但报障状态刚刚变化，请发送 /debug status 查看。"
             log.info(
                 "报障 %s 已提交第 %s 次 NPC 分析请求，将每 %s 秒查询一次 CNB 评论。",
                 task_id,
                 analysis_round,
                 self._poll_interval(),
             )
-            return True, "已要求 NPC 重新分析，完成后会转发详细分析并发送结论。"
+            return True, (
+                f"已请{self._assistant()}结合补充信息重新分析，通常需要几分钟"
+                f"（最长 {format_duration(analysis_wait)}），完成后会在这里通知你。"
+            )
 
     async def _create_issue_from_prepared(
         self, task_id: str, notify_issue_created: bool = True
@@ -814,7 +822,7 @@ class ReportJobs:
                 return
             prepared_path = str(task.get("prepared_path", ""))
             if not prepared_path or not Path(prepared_path).is_file():
-                await self._finish(task, "FAILED", "待上传的日志文件在恢复时丢失。")
+                await self._finish(task, "FAILED", "插件重启后找不到待提交的日志，请重新发送 /debug 并上传。")
                 return
             try:
                 client = self._client(str(task.get("repository", "")))
@@ -862,10 +870,7 @@ class ReportJobs:
                         fields={"issue_number": issue_number, "issue_url": issue_url},
                     )
                     Path(prepared_path).unlink(missing_ok=True)
-                    await self._notify(
-                        current,
-                        f"报障 {task_id} 已在取消请求期间创建 Issue，未再触发 NPC：{issue_url}",
-                    )
+                    await self._notify(current, self._cancelled_after_issue_notice(issue_url))
                     return
                 transitioned = self.store.update(
                     task_id,
@@ -875,7 +880,7 @@ class ReportJobs:
                         "issue_url": issue_url,
                         "trigger_body": trigger_body,
                         "trigger_started_at": now,
-                        "analysis_deadline": now + int(self.config.get("analysis_wait_seconds", 1200)),
+                        "analysis_deadline": now + analysis_wait_seconds(self.config),
                         "external_phase": "trigger_comment",
                         "description": "",
                         "context_snapshot": "",
@@ -895,17 +900,11 @@ class ReportJobs:
                     ) or current
                     Path(prepared_path).unlink(missing_ok=True)
                     if current["status"] == "CANCELLED":
-                        await self._notify(
-                            current,
-                            f"报障 {task_id} 已在取消请求期间创建 Issue，未再触发 NPC：{issue_url}",
-                        )
+                        await self._notify(current, self._cancelled_after_issue_notice(issue_url))
                     return
                 Path(prepared_path).unlink(missing_ok=True)
                 if notify_issue_created:
-                    await self._notify(
-                        current,
-                        f"报障 {task_id} 已创建 CNB Issue：{issue_url}\n日志已上传并开始请求 NPC 分析。",
-                    )
+                    await self._notify(current, self._submitted_notice(current, issue_url))
                 current = self.store.get(task_id) or current
                 if current["status"] != "TRIGGERING_NPC":
                     return
@@ -929,15 +928,9 @@ class ReportJobs:
                     )
                     latest = self.store.get(task_id)
                     if latest and latest["status"] == "UNCERTAIN":
-                        await self._notify(
-                            latest,
-                            f"报障 {task_id} 的 NPC 触发请求结果不确定，插件正在核对 Issue 评论，不会重复提交。",
-                        )
+                        await self._notify(latest, self._trigger_uncertain_notice(latest))
                     elif latest and latest["status"] == "CANCELLED":
-                        await self._notify(
-                            latest,
-                            f"报障 {task_id} 已取消；取消前发出的 NPC 请求结果不确定，请检查 Issue 评论：{latest.get('issue_url', '')}",
-                        )
+                        await self._notify(latest, self._cancelled_after_trigger_notice(latest))
                     return
                 except CNBAPIError as exc:
                     if _api_error_is_ambiguous(exc):
@@ -954,20 +947,15 @@ class ReportJobs:
                         )
                         latest = self.store.get(task_id)
                         if latest and latest["status"] == "UNCERTAIN":
-                            await self._notify(
-                                latest,
-                                f"报障 {task_id} 的 NPC 触发请求返回服务端错误，插件正在核对评论，不会重复提交。",
-                            )
+                            await self._notify(latest, self._trigger_uncertain_notice(latest))
                         elif latest and latest["status"] == "CANCELLED":
-                            await self._notify(
-                                latest,
-                                f"报障 {task_id} 已取消；NPC 请求返回服务端错误，请检查 Issue 评论：{latest.get('issue_url', '')}",
-                            )
+                            await self._notify(latest, self._cancelled_after_trigger_notice(latest))
                     else:
                         await self._finish(
                             self.store.get(task_id) or current,
                             "FAILED",
-                            f"NPC 触发评论被 CNB 拒绝：{exc}",
+                            f"请求{self._assistant()}分析失败（CNB 拒绝了请求），请联系管理员。"
+                            f"Issue：{issue_url}\n原因：{exc}",
                         )
                     return
                 trigger_comment_id = str(comment.get("id", "")) if isinstance(comment, dict) else ""
@@ -1001,10 +989,7 @@ class ReportJobs:
                         self._poll_interval(),
                     )
                 if transitioned and transitioned["status"] == "CANCELLED":
-                    await self._notify(
-                        transitioned,
-                        f"报障 {task_id} 已取消；取消前 NPC 触发评论可能已创建，请检查 Issue：{transitioned.get('issue_url', '')}",
-                    )
+                    await self._notify(transitioned, self._cancelled_after_trigger_notice(transitioned))
             except CNBNetworkError as exc:
                 current = self.store.get(task_id) or task
                 phase = current.get("external_phase", "prepared")
@@ -1026,20 +1011,15 @@ class ReportJobs:
                     )
                     latest = self.store.get(task_id)
                     if updated and updated["status"] == "UNCERTAIN":
-                        await self._notify(
-                            latest or current,
-                            f"报障 {task_id} 的 Issue 创建请求结果不确定。为防止重复 Issue，插件没有重试；请在目标仓库按报障编号搜索。",
-                        )
+                        await self._notify(latest or current, self._issue_uncertain_notice(latest or current))
                     elif latest and latest["status"] == "CANCELLED":
-                        await self._notify(
-                            latest,
-                            f"报障 {task_id} 已取消；取消前的 Issue 创建请求结果不确定，请到目标仓库按编号搜索。若已创建，Issue 会保留。",
-                        )
+                        await self._notify(latest, self._issue_uncertain_notice(latest, cancelled=True))
                 else:
                     await self._finish(
                         current,
                         "FAILED",
-                        f"CNB 附件上传结果不确定，未创建 Issue：{exc}",
+                        "日志上传到 CNB 失败，未创建 Issue；请稍后重新发送 /debug 再试。"
+                        f"\n原因：{exc}",
                     )
             except CNBAPIError as exc:
                 current = self.store.get(task_id) or task
@@ -1061,17 +1041,16 @@ class ReportJobs:
                     )
                     latest = self.store.get(task_id)
                     if updated and updated["status"] == "UNCERTAIN":
-                        await self._notify(
-                            latest or current,
-                            f"报障 {task_id} 的 Issue 创建返回服务端错误，结果需要核对；插件没有重复创建。",
-                        )
+                        await self._notify(latest or current, self._issue_uncertain_notice(latest or current))
                     elif latest and latest["status"] == "CANCELLED":
-                        await self._notify(
-                            latest,
-                            f"报障 {task_id} 已取消；取消前的 Issue 创建请求返回服务端错误，请到目标仓库按编号搜索。",
-                        )
+                        await self._notify(latest, self._issue_uncertain_notice(latest, cancelled=True))
                 else:
-                    await self._finish(current, "FAILED", f"CNB API 失败：{exc}")
+                    await self._finish(
+                        current,
+                        "FAILED",
+                        "提交到 CNB 失败，请稍后重新发送 /debug 再试；如持续失败请联系管理员。"
+                        f"\n原因：{exc}",
+                    )
             except Exception as exc:
                 log.exception("创建 CNB Issue 流程失败，报障编号 %s", task_id)
                 current = self.store.get(task_id) or task
@@ -1082,7 +1061,7 @@ class ReportJobs:
                         status="UNCERTAIN",
                         fields={
                             "uncertain_kind": "issue_creation",
-                            "last_error": "Issue 创建后发生内部错误；为避免重复，插件没有重试。",
+                            "last_error": "创建 Issue 时插件出错，无法确认 Issue 是否已创建。",
                             "description": "",
                             "context_snapshot": "",
                             "prepared_path": "",
@@ -1094,22 +1073,16 @@ class ReportJobs:
                     )
                     latest = self.store.get(task_id)
                     if latest and latest["status"] == "UNCERTAIN":
-                        await self._notify(
-                            latest,
-                            f"报障 {task_id} 的 Issue 创建流程发生内部错误，结果需要核对；插件没有重试。请在目标仓库按编号搜索。",
-                        )
+                        await self._notify(latest, self._issue_uncertain_notice(latest))
                     elif latest and latest["status"] == "CANCELLED":
-                        await self._notify(
-                            latest,
-                            f"报障 {task_id} 已取消；取消前的 Issue 创建流程发生内部错误，请到目标仓库按编号搜索。",
-                        )
+                        await self._notify(latest, self._issue_uncertain_notice(latest, cancelled=True))
                 elif phase == "trigger_comment":
                     self.store.update(
                         task_id,
                         status="UNCERTAIN",
                         fields={
                             "uncertain_kind": "trigger_comment",
-                            "last_error": "NPC 触发评论请求后发生内部错误，正在核对评论。",
+                            "last_error": "提交分析请求时插件出错，正在确认请求是否已提交。",
                             "next_poll_at": time.time() + 5,
                             "poll_attempts": 0,
                         },
@@ -1117,12 +1090,14 @@ class ReportJobs:
                     )
                     latest = self.store.get(task_id)
                     if latest and latest["status"] == "UNCERTAIN":
-                        await self._notify(
-                            latest,
-                            f"报障 {task_id} 的 NPC 触发请求发生内部错误，插件正在核对 Issue 评论，不会重复提交。",
-                        )
+                        await self._notify(latest, self._trigger_uncertain_notice(latest))
                 else:
-                    await self._finish(current, "FAILED", f"插件处理失败：{exc}")
+                    await self._finish(
+                        current,
+                        "FAILED",
+                        "提交时插件出错，请稍后重新发送 /debug 再试；如持续失败请联系管理员。"
+                        f"\n原因：{exc}",
+                    )
             finally:
                 latest = self.store.get(task_id)
                 if latest and latest["status"] in TERMINAL_STATUSES | {"WAITING_NPC", "TRIGGERING_NPC", "UNCERTAIN"}:
@@ -1148,7 +1123,7 @@ class ReportJobs:
             "## 原始日志附件\n"
             f"{attachment}\n\n"
             f"文件类型：{file_type}\n"
-            f"文件大小：{file_bytes} 字节\n"
+            f"文件大小：{format_bytes(file_bytes)}（{file_bytes} 字节）\n"
             "插件直接上传原始文件，不读取、扫描或脱敏文件内容。\n\n"
             f"内部追踪编号：`{task['id']}`"
         )
@@ -1441,7 +1416,7 @@ class ReportJobs:
                 await self._finish(
                     task,
                     "FAILED",
-                    f"向原会话发送 NPC 分析转发失败，已停止自动重试；可查看 Issue：{task.get('issue_url', '')}。",
+                    f"{self._assistant()}的分析结果发送失败，请直接查看 Issue：{task.get('issue_url', '')}",
                     extra_fields={
                         "last_delivery_error": error_message,
                         "delivery_parts": [],
@@ -1488,12 +1463,11 @@ class ReportJobs:
             await self._await_recovery_confirmation(updated, len(parts))
 
     async def _await_recovery_confirmation(self, task: dict[str, Any], delivered_parts: int) -> None:
-        summary = str(task.get("analysis_summary") or "NPC 已返回分析，详见转发。")
-        recovery_deadline = time.time() + RECOVERY_CONFIRM_TIMEOUT_SECONDS
+        recovery_deadline = time.time() + self._recovery_timeout()
         await self._finish(
             task,
             "AWAITING_RECOVERY",
-            "NPC 分析已转发。",
+            "分析结果已转发。",
             extra_fields={
                 "delivered_parts": delivered_parts,
                 "delivery_parts": [],
@@ -1503,10 +1477,7 @@ class ReportJobs:
                 "next_issue_check_at": time.time() + self._issue_check_interval(),
                 "last_issue_error": "",
             },
-            notify_message=(
-                f"结论：{summary}\n处理并确认恢复后，请在 5 分钟内发送 /debug resolve；"
-                "超时后 CNB Issue 会自动关闭。"
-            ),
+            notify_message=self._recovery_prompt(task),
         )
 
     def _issue_check_interval(self) -> int:
@@ -1540,7 +1511,7 @@ class ReportJobs:
             now = time.time()
             recovery_deadline = self._recovery_deadline(task)
             if recovery_deadline <= 0:
-                recovery_deadline = now + RECOVERY_CONFIRM_TIMEOUT_SECONDS
+                recovery_deadline = now + self._recovery_timeout()
                 self.store.update(
                     task_id,
                     fields={"recovery_deadline": recovery_deadline},
@@ -1603,6 +1574,8 @@ class ReportJobs:
                 issue = await asyncio.to_thread(client.get_issue, issue_number)
                 state = self._issue_state(issue)
                 if state == "open":
+                    if close_reason == "timeout" and not task.get("timeout_comment_posted"):
+                        await self._post_timeout_comment(client, task, issue_number)
                     await asyncio.to_thread(client.close_issue, issue_number)
                     # A PATCH can succeed while its response is lost or stale.
                     # Verify the canonical Issue state before completing the task.
@@ -1613,21 +1586,12 @@ class ReportJobs:
                 await self._finish(
                     task,
                     "DONE",
-                    (
-                        "5 分钟内未收到 /debug resolve，报障已自动结束，CNB Issue 已关闭。"
-                        if close_reason == "timeout"
-                        else "已确认恢复，CNB Issue 已关闭。"
-                    ),
+                    self._done_message(close_reason),
                     extra_fields={
                         "issue_state": "closed",
                         "last_issue_error": "",
                         "issue_close_attempts": int(task.get("issue_close_attempts", 0)),
                     },
-                    notify_message=(
-                        "5 分钟内未收到 /debug resolve，报障已自动结束，CNB Issue 已关闭。"
-                        if close_reason == "timeout"
-                        else "已确认恢复，CNB Issue 已关闭。"
-                    ),
                 )
             except Exception as exc:
                 attempts = int(task.get("issue_close_attempts", 0)) + 1
@@ -1660,27 +1624,27 @@ class ReportJobs:
     ) -> tuple[bool, str]:
         task = self.store.get(task_id)
         if not task:
-            return False, "没有找到这个报障编号。"
+            return False, "没有找到这次报障。"
         if (
             task["user_id"] != str(user_id)
             or task["platform_name"] != platform_name
             or task["bot_id"] != bot_id
             or task["group_id"] != group_id
         ):
-            return False, "只有发起报障的用户能确认恢复。"
+            return False, "只有发起报障的人可以确认是否解决。"
 
         lock = self._task_locks.setdefault(task_id, asyncio.Lock())
         close_reason = str(task.get("close_reason", ""))
         async with lock:
             task = self.store.get(task_id) or task
             if task.get("status") == "DONE":
-                return True, "该报障已完成，CNB Issue 已关闭。"
+                return True, "这次报障已经结束，Issue 已关闭。"
             eligible = task.get("status") == "AWAITING_RECOVERY"
             if eligible:
                 now = time.time()
                 recovery_deadline = self._recovery_deadline(task)
                 if recovery_deadline <= 0:
-                    recovery_deadline = now + RECOVERY_CONFIRM_TIMEOUT_SECONDS
+                    recovery_deadline = now + self._recovery_timeout()
                 close_reason = "timeout" if recovery_deadline <= now else "user"
                 close_fields = {
                     "close_reason": close_reason,
@@ -1699,7 +1663,10 @@ class ReportJobs:
                     expected_statuses={str(task.get("status"))},
                 ) or task
             elif task.get("status") not in {"CLOSING_ISSUE", "DONE"}:
-                return False, "NPC 分析转发完成后，才能确认恢复并关闭 Issue。"
+                return False, (
+                    f"{self._assistant()}的分析结果发出后才能确认是否解决。"
+                    f"当前状态：{status_label(task)}。"
+                )
             else:
                 close_reason = str(task.get("close_reason", "user"))
 
@@ -1707,15 +1674,16 @@ class ReportJobs:
             await self._close_issue_after_confirmation(task_id)
             latest = self.store.get(task_id) or task
             if latest.get("status") == "DONE":
-                if close_reason == "timeout":
-                    return True, "超过 5 分钟未收到 /debug resolve，CNB Issue 已自动关闭。"
-                return True, "已确认恢复，CNB Issue 已关闭。"
+                return True, self._done_message(close_reason)
             if close_reason == "timeout":
-                return True, "超过 5 分钟未收到 /debug resolve，插件正在自动关闭 CNB Issue；发送 /debug status 查看进度。"
-            return True, "已记录恢复确认，正在关闭 CNB Issue；发送 /debug status 可刷新进度。"
+                return True, (
+                    f"确认时限（{format_duration(self._recovery_timeout())}）已过，报障正在自动结束；"
+                    "如果问题仍未解决，请重新发送 /debug 报障。"
+                )
+            return True, "已确认解决，正在关闭 Issue；稍后发送 /debug status 可查看结果。"
         if task.get("status") == "DONE" and task.get("issue_state") == "closed":
-            return True, "该报障已完成，CNB Issue 已关闭。"
-        return False, "该报障尚未进入恢复确认阶段。"
+            return True, "这次报障已经结束，Issue 已关闭。"
+        return False, f"当前状态为“{status_label(task)}”，还不能确认是否解决。"
 
     def _delivery_send_timeout(self) -> float:
         try:
@@ -1757,7 +1725,7 @@ class ReportJobs:
         chain.chain.append(
             Comp.Node(
                 uin=str(task.get("bot_id") or "0"),
-                name="NPC 分析结果",
+                name=f"{self._assistant()}分析结果",
                 content=[Comp.Plain(text)],
             )
         )
@@ -1805,46 +1773,182 @@ class ReportJobs:
         if updated:
             await self._notify(
                 updated,
-                notify_message or f"报障 {task['id']}：{message}",
+                notify_message or message,
             )
 
-    async def status(self, task: dict[str, Any]) -> str:
-        status = task["status"]
-        lines = [f"报障编号：{task['id']}", f"状态：{STATUS_LABELS.get(status, status)}"]
+    def format_status(self, task: dict[str, Any]) -> str:
+        status = str(task.get("status", ""))
+        now = time.time()
+        lines = [f"状态：{status_label(task)}"]
         if task.get("issue_url"):
             lines.append(f"Issue：{task['issue_url']}")
-        if task.get("last_error"):
+            if task.get("issue_state") == "closed" and status != "DONE":
+                lines.append("Issue 已被关闭。")
+        if status == "WAITING_LOG":
+            remaining = float(task.get("deadline", 0)) - now
+            if task.get("last_error"):
+                lines.append(f"上次上传未成功：{task['last_error']}")
+            lines.append(f"请在 {format_duration(remaining)}内上传一个 .zip 或 .log 日志文件。")
+        elif status == "WAITING_NPC":
+            started = float(task.get("trigger_at") or task.get("trigger_started_at") or now)
+            remaining = float(task.get("analysis_deadline", 0)) - now
+            lines.append(
+                f"{self._assistant()}已分析 {format_duration(now - started)}，"
+                f"最长还需 {format_duration(remaining)}；完成后会在这里通知你。"
+            )
+            if task.get("last_poll_error"):
+                lines.append("刚才查询 CNB 失败，插件会自动重试。")
+        elif status == "DELIVERING" and task.get("last_delivery_error"):
+            lines.append("分析结果发送失败，插件正在自动重试；也可以直接打开 Issue 查看。")
+        elif status == "AWAITING_RECOVERY":
+            if task.get("analysis_summary"):
+                lines.append(f"结论：{task['analysis_summary']}")
+            remaining = self._recovery_deadline(task) - now
+            lines.append(self._recovery_options(task))
+            lines.append(f"{format_duration(remaining)}内没有确认将自动结束报障。")
+        elif status == "CLOSING_ISSUE" and task.get("last_issue_error"):
+            lines.append("关闭 Issue 暂时失败，插件会自动重试。")
+        elif status == "UNCERTAIN":
+            if task.get("uncertain_kind") == "issue_creation":
+                lines.append("无法确认 Issue 是否已创建。")
+                if task.get("last_error"):
+                    lines.append(f"原因：{task['last_error']}")
+                lines.append(admin_trace_hint(task))
+            else:
+                lines.append(f"正在确认{self._assistant()}是否已收到分析请求，无需重复操作。")
+        elif status in {"FAILED", "CANCELLED"} and task.get("last_error"):
             lines.append(f"说明：{task['last_error']}")
-        if status == "UNCERTAIN" and task.get("uncertain_kind") == "issue_creation":
-            lines.append("请到配置的 CNB 仓库搜索报障编号；插件不会自动重复创建。")
+        if status in TERMINAL_STATUSES:
+            lines.append("需要时可发送 /debug 开始新的报障。")
         return "\n".join(lines)
+
+    # ----- user-facing wording -------------------------------------------------
+
+    def _assistant(self) -> str:
+        return assistant_name(self.config)
+
+    def _recovery_timeout(self) -> int:
+        return recovery_confirm_seconds(self.config)
+
+    @staticmethod
+    def _supplement_how(task: dict[str, Any]) -> str:
+        return "@我" if task.get("group_id") else "直接私信"
+
+    def _recovery_options(self, task: dict[str, Any]) -> str:
+        return (
+            "问题解决了吗？\n"
+            "· 已解决：发送 /debug resolve\n"
+            f"· 没解决：{self._supplement_how(task)}补充现象，再发送 /debug analyze 重新分析"
+        )
+
+    def _recovery_prompt(self, task: dict[str, Any]) -> str:
+        summary = str(task.get("analysis_summary") or "已返回分析，详见合并转发。")
+        return (
+            f"结论：{summary}\n"
+            f"{self._recovery_options(task)}\n"
+            f"{format_duration(self._recovery_timeout())}内没有确认将自动结束报障。"
+        )
+
+    def _done_message(self, close_reason: str) -> str:
+        if close_reason == "timeout":
+            return (
+                f"{format_duration(self._recovery_timeout())}内没有收到确认，报障已自动结束，Issue 已关闭。\n"
+                "如果问题仍未解决，请重新发送 /debug 报障。"
+            )
+        return "已确认解决，报障结束，Issue 已关闭。感谢反馈！"
+
+    def _submitted_notice(self, task: dict[str, Any], issue_url: str = "") -> str:
+        url = issue_url or str(task.get("issue_url", ""))
+        return (
+            f"日志已提交，{self._assistant()}正在分析，通常需要几分钟"
+            f"（最长 {format_duration(analysis_wait_seconds(self.config))}），完成后会在这里通知你。\n"
+            f"Issue：{url}\n"
+            f"期间可{self._supplement_how(task)}补充信息，发送 /debug status 查看进度。"
+        )
+
+    def _analysis_timeout_message(self, task: dict[str, Any]) -> str:
+        return (
+            f"{self._assistant()}在限定时间内没有给出结果，报障已结束。"
+            f"Issue 会保留，可稍后查看：{task.get('issue_url', '')}"
+        )
+
+    @staticmethod
+    def _reupload_notice(task: dict[str, Any]) -> str:
+        remaining = float(task.get("deadline", 0)) - time.time()
+        return f"插件重启打断了日志提交，请在 {format_duration(remaining)}内重新上传日志。"
+
+    @staticmethod
+    def _issue_uncertain_notice(task: dict[str, Any], cancelled: bool = False) -> str:
+        if cancelled:
+            return (
+                "报障已取消，但取消前的 Issue 创建结果无法确认；若已创建，Issue 会保留。\n"
+                + admin_trace_hint(task)
+            )
+        return "无法确认 Issue 是否已创建。\n" + admin_trace_hint(task)
+
+    def _trigger_uncertain_notice(self, task: dict[str, Any]) -> str:
+        return f"正在确认{self._assistant()}是否已收到分析请求，稍后会自动继续，无需重复操作。"
+
+    def _cancelled_after_trigger_notice(self, task: dict[str, Any]) -> str:
+        return (
+            f"报障已取消；取消前的分析请求可能已发出，{self._assistant()}的回复不会再转发给你。"
+            f"Issue：{task.get('issue_url', '')}"
+        )
+
+    def _cancelled_after_issue_notice(self, issue_url: str) -> str:
+        return f"报障已取消；取消前 Issue 已创建并保留，没有请求{self._assistant()}分析：{issue_url}"
+
+    @staticmethod
+    def _comment_uncertain_notice(task: dict[str, Any]) -> str:
+        return (
+            "网络异常，补充信息可能没有提交成功。请先打开 Issue 查看，没有的话再发一次："
+            f"{task.get('issue_url', '')}"
+        )
+
+    async def _post_timeout_comment(
+        self, client: CNBClient, task: dict[str, Any], issue_number: str
+    ) -> None:
+        """Leave an at-most-once note so a timeout close is not read as a fix."""
+        self.store.update(
+            str(task["id"]),
+            fields={"timeout_comment_posted": True},
+            expected_statuses={"CLOSING_ISSUE"},
+        )
+        body = (
+            f"报障人在 {format_duration(self._recovery_timeout())}内没有确认问题是否解决，"
+            "插件已自动关闭此 Issue。问题可能仍未解决，如有需要可重新打开。"
+        )
+        try:
+            await asyncio.to_thread(client.create_comment, issue_number, body)
+        except Exception as exc:
+            log.warning("报障 %s 发布超时关闭说明失败，继续关闭 Issue：%s", task["id"], exc)
 
     def cancel(self, task_id: str, user_id: str, platform_name: str, bot_id: str, group_id: str) -> tuple[bool, str]:
         task = self.store.get(task_id)
         if not task:
-            return False, "没有找到这个报障编号。"
+            return False, "没有找到这次报障。"
         if (
             task["user_id"] != str(user_id)
             or task["platform_name"] != platform_name
             or task["bot_id"] != bot_id
             or task["group_id"] != group_id
         ):
-            return False, "只有发起报障的用户能取消此任务。"
+            return False, "只有发起报障的人可以取消。"
         if task["status"] in TERMINAL_STATUSES:
-            return False, f"该任务已处于“{STATUS_LABELS.get(task['status'], task['status'])}”状态。"
-        note = "等待和后续转发已停止。"
+            return False, f"这次报障已是“{status_label(task)}”状态，无需取消。"
+        note = "已取消报障。"
         if task.get("issue_url"):
-            note += f"已创建的 Issue 保留：{task['issue_url']}"
+            note += f"\n已创建的 Issue 会保留：{task['issue_url']}"
         if task.get("status") == "CREATING_ISSUE" or (
             task.get("status") == "UNCERTAIN"
             and task.get("uncertain_kind") == "issue_creation"
         ):
-            note += " Issue 创建请求可能已经发出，取消无法撤回；请按报障编号到目标仓库核对。"
+            note += "\nIssue 可能已经创建，取消无法撤回。" + admin_trace_hint(task)
         elif task.get("status") == "TRIGGERING_NPC" or (
             task.get("status") == "UNCERTAIN"
             and task.get("uncertain_kind") == "trigger_comment"
         ):
-            note += " NPC 触发评论可能已经发出；即使 NPC 完成分析，插件也会停止转发。"
+            note += f"\n{self._assistant()}可能仍会在 Issue 中回复，但不会再转发给你。"
         updated = self.store.update(
             task_id,
             status="CANCELLED",
@@ -1864,8 +1968,8 @@ class ReportJobs:
             expected_statuses=ACTIVE_STATUSES,
         )
         if not updated or updated["status"] != "CANCELLED":
-            current_status = updated["status"] if updated else "已结束"
-            return False, f"该任务已处于“{STATUS_LABELS.get(current_status, current_status)}”状态。"
+            label = status_label(updated) if updated else "已结束"
+            return False, f"这次报障已是“{label}”状态，无需取消。"
         path = task.get("prepared_path")
         if path:
             Path(path).unlink(missing_ok=True)

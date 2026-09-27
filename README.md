@@ -1,84 +1,63 @@
-# AstrBot CNB 报障助手
+# CNB 报障助手
 
-AstrBot 插件：用户在已启用的群或私信中发送 `/debug` 发起报障，接收原始 ZIP 或 LOG 日志，创建 CNB Issue，再跟踪已验证身份的 CNB NPC 最终回复并转发回报障来源会话。
+一个 AstrBot 插件。用户在 QQ 群或私信里发 `/debug`、传一份日志，插件会在 CNB 仓库开一个 Issue，让仓库的 NPC（比如 CodeBuddy）分析，再把结论发回聊天里。
 
-当前接入目标为 AstrBot 4.16–4.x 和 `aiocqhttp`（OneBot v11）。群聊需配置群白名单；私信默认允许所有用户，只有配置 `private_whitelist` 后才限制为名单中的平台用户 ID。任务按平台、机器人、会话和用户标识隔离，便于接入其他平台；文件接收和详细分析转发仍取决于适配器的能力。NPC 作者字段应按目标仓库实际回复配置。
-
-## 用户指令
-
-斜线命令无需 @机器人或 UUID；故障描述可选。群聊命令只在群白名单内生效；私信命令默认开放，也可通过私信白名单限制。AstrBot 的唤醒前缀需包含 `/`（默认配置）。
+一次完整的报障大概是这样：
 
 ```text
-/debug
-/debug M9A运行失败
-/debug 启动后报错，无法进入主界面
-/debug analyze
-/debug status
-/debug resolve
-/debug cancel
-@机器人 点击继续后仍提示 M9A，补充日志中的时间是 12:30
+用户    /debug 启动后闪退
+机器人  请在 10 分钟内由你本人在本群上传一个 .zip 或 .log 日志文件。
+        上传后会创建 Issue 并请分析助手分析；之后可 @我 补充信息。
+用户    [上传 debug.zip]
+机器人  日志已提交，分析助手正在分析，通常需要几分钟（最长 20 分钟）。
+        Issue：https://cnb.cool/group/repo/-/issues/42
+        ……几分钟后……
+机器人  [合并转发] 分析助手分析结果
+机器人  @用户 结论：配置文件路径错误。
+        问题解决了吗？
+        · 已解决：发送 /debug resolve
+        · 没解决：@我 补充现象，再发送 /debug analyze 重新分析
+用户    /debug resolve
+机器人  已确认解决，报障结束，Issue 已关闭。感谢反馈！
 ```
 
-私信机器人时，流程相同：发送 `/debug`、上传日志；Issue 创建后可直接私信补充信息，再发送 `/debug analyze` 重新分析。私信中的普通文字只会在该用户有活跃报障且 Issue 已创建时写入对应 Issue 评论。
+## 环境要求
 
-`/debug` 后可选填故障描述，插件会把整段描述（包括空格）用作 CNB Issue 标题；省略时使用默认标题。发起任务的同一账号须在默认 10 分钟内上传一个 `.zip` 或 `.log` 文件。群聊中，发起人 @机器人发送的文字会成为 Issue 评论；私信中，该用户在活跃报障期间发来的普通文字会成为 Issue 评论。需要 NPC 结合补充信息重新分析时，发送 `/debug analyze`。群聊中的其他普通消息不会被收集。插件将任务绑定到平台实例、机器人、会话和发起用户；每个会话中，同一用户同时只能有一个未结束任务。重复发送 `/debug` 会提示现有任务，不会另建任务。`/debug status` 会立即推进并核对当前任务的全部安全状态步骤，不等待后台轮询；没有活跃任务时显示最近一次结果。查询过程中不额外发送状态提示，只保留一条查询结果；如发现 NPC 最终回复，仍会发送分析转发。NPC 详细分析通过一条 QQ 合并转发发送；转发后普通消息只显示一句结论和 `/debug resolve` 提示。任务随后等待恢复确认；确认已恢复时发送 `/debug resolve`，插件核对并关闭 CNB Issue 后才结束任务。`/debug cancel` 只取消自己的任务，不会删除已创建的 Issue。内部仍使用 UUID 关联 NPC 回复和恢复状态，用户无需输入。
+- AstrBot 4.16 及以上的 4.x 版本
+- `aiocqhttp`（OneBot v11）适配器，需要能收到群文件消息
+- 一个 CNB 仓库，并且仓库里配好了能被 @ 触发的 NPC
 
-## 安装与配置
 
-将本目录作为 `astrbot_plugin_cnb_bot` 插件放入 AstrBot 插件目录并重载插件。部署时确认 AstrBot 版本为 4.16–4.x，并启用可提供群消息和文件消息的 `aiocqhttp` 适配器。
 
-在插件配置中填写：
+## 最少要填的配置
 
-| 配置 | 必填 | 说明 |
-| --- | --- | --- |
-| `group_whitelist` | 群聊报障时必填 | 启用功能的 QQ 群号列表。留空表示不启用任何群。 |
-| `private_whitelist` | 否 | 可选的平台用户 ID 白名单。留空时所有用户均可私信报障；填写后仅允许名单内用户。 |
-| `cnb_repository` | 是 | CNB 仓库路径，例如 `group/repo`。 |
-| `cnb_token` | 是 | CNB 访问令牌；需要 Issue 写入和评论读写权限（`repo-issue:rw`、`repo-notes:r`、`repo-notes:rw`）。 |
-| `npc_mention` | 是 | CNB Issue 评论中真实可触发 NPC 的提及文本，默认 `@CodeBuddy`。 |
-| `npc_author_ids` 或 `npc_author_usernames` | 否 | 作者 username 默认 `CodeBuddy`；若目标仓库实际作者不同，请填写核实过的 ID 或 username，精确匹配。优先使用 ID。 |
+| 配置 | 说明 |
+| --- | --- |
+| `cnb_repository` | 仓库路径，如 `group/repo` |
+| `cnb_token` | CNB 访问令牌，需要 `repo-issue:rw`、`repo-notes:r`、`repo-notes:rw` |
+| `group_whitelist` | 允许报障的 QQ 群号；只用私信的话可以留空 |
+| `npc_author_usernames` | NPC 回复作者的 username，默认 `CodeBuddy`，请按仓库里实际的回复账号填写 |
 
-插件只接受 HTTPS 的 CNB API 和网页端点。默认地址分别是 `https://api.cnb.cool` 和 `https://cnb.cool`。令牌保存在 AstrBot 插件配置中，不写入报障任务或 Issue。
+私信默认对所有人开放。其余配置项见 [配置说明](docs/configuration.md)。
 
-其余参数可调整日志等待和 NPC 等待时长、评论轮询间隔、单个 ZIP 或 LOG 文件大小上限、群文件下载域名白名单、分析转发单次发送超时及最大重试次数，以及本地历史保留天数。默认日志等待 10 分钟；NPC 最长等待 20 分钟；NPC 评论正常每 10 秒查询一次，CNB 请求失败时逐步退避、最长间隔 120 秒；单个日志文件最大 20 MiB；分析转发单次发送超时 30 秒，失败最多尝试 10 次。
+## 指令
 
-插件元数据已配置 GitHub 仓库地址；发布前请确认该地址仍是实际发布仓库。
+| 指令 | 作用 |
+| --- | --- |
+| `/debug [描述]` | 开始报障。描述会作为 Issue 标题，可以不写 |
+| `/debug status` | 查看进度 |
+| `/debug analyze` | 补充信息后，让 NPC 重新分析 |
+| `/debug resolve` | 确认问题已解决，关闭 Issue |
+| `/debug cancel` | 取消报障，已创建的 Issue 会保留 |
+| `/debug help` | 列出指令 |
 
-## 处理流程
+这些子命令也能用中文：`状态`、`分析`、`已解决`、`取消`、`帮助`。
 
-1. 发送 `/debug` 创建等待日志的任务，然后上传一个 `.zip` 或 `.log` 文件。普通群消息不缓存、不收集。
-2. 收到同一用户上传的日志后，插件只检查文件扩展名、下载来源和文件大小，然后将原始文件作为 Issue 附件上传 CNB；不解压、扫描或脱敏文件内容。
-3. Issue 正文包含日志附件链接、文件类型和大小、处理说明和内部追踪编号；不提交聊天上下文，旧任务中的描述和聊天快照也不会写入新 Issue。Issue 创建后，发起人 @机器人发送的文字会成为新的 Issue 评论；补充评论后发送 `/debug analyze`，插件会在该 Issue 评论中再次 @配置的 NPC，要求结合新增内容重新分析。
-4. 每次分析请求都会使用独立标记。插件分页轮询评论，只接受同时满足以下条件的回复：作者 ID 或 username 与配置完全匹配；正文包含当前轮次的最终回复标记；评论时间不早于本次触发。触发提示要求 NPC 将回复分为“一句话描述”和“详细分析”，并区分已确认事实与推测。
-5. 找到最终回复后，插件把 Issue 链接以及整理为“一句话描述 / 详细分析”的完整内容放入一个 QQ 合并转发节点。转发成功后，报障来源会话只收到一句结论和 `/debug resolve` 提示。旧回复或未按格式回复的 NPC 内容会以原文首句作为描述，并完整保留原文。单次发送有超时限制，网络超时后会重试；如果 AstrBot 在平台已发送、但本地尚未记录时退出或发送确认超时，该转发可能重复发送。私信合并转发依赖 OneBot 客户端实现 `send_private_forward_msg`。等待用户确认恢复时，Issue 最多保持打开 5 分钟。
-6. 用户按建议处理并确认故障恢复后，应在发起报障的群或私信会话 5 分钟内发送 `/debug resolve`。插件核对 Issue 状态、关闭 Issue 并验证已关闭后将任务标为完成；关闭请求失败时会自动重试。5 分钟内没有收到 `/debug resolve` 时，插件会自动关闭 Issue 并结束跟踪。`/debug status` 也会检查 Issue 状态。
+Issue 创建后，想补充情况时，群里 @机器人 发文字即可，私信里直接发。文字会作为评论写进 Issue。群里其他没有 @机器人 的消息，插件不会记录。
 
-## 状态与恢复
+## 文档
 
-任务状态包括 `WAITING_LOG`、`PREPARING_LOG`、`CREATING_ISSUE`、`TRIGGERING_NPC`、`WAITING_NPC`、`DELIVERING`、`AWAITING_RECOVERY`、`CLOSING_ISSUE`、`DONE`、`EXPIRED`、`CANCELLED`、`FAILED` 和 `UNCERTAIN`。
-
-插件首次加载和热重载都会启动后台轮询；日志面板会记录轮询开始、评论匹配结果、查询失败及转发成功。
-
-状态保存在插件数据目录的 `reports.sqlite3` 中；临时目录 `tmp/` 暂存收到的原始日志，`prepared/` 暂存等待 CNB 上传的原始日志。上传成功、失败或取消后会删除暂存文件。完成任务后，插件会清除 NPC 转发正文及旧版本遗留的问题描述、群上下文字段。终态任务记录默认在本地保留 90 天，之后在插件启动时清理；活跃任务不受该清理影响。数据库会保存平台、机器人、群、用户及会话标识以支持路由和状态查询，这些标识不会写入 CNB Issue。
-
-创建 Issue 或 NPC 评论遇到网络中断或插件重启时，结果可能不确定。为避免重复 Issue 或重复触发 NPC，插件不会盲目重试：Issue 创建阶段会提示管理员按 UUID 到仓库核对；触发评论阶段会先按完整评论正文核对。若状态显示 `UNCERTAIN`，请用 `/debug status` 查看说明。取消不删除可能已经创建的 CNB 内容。
-
-## 安全与边界
-
-- 开始报障时插件会提醒用户：仅提交一个原始 ZIP 或 LOG 文件，不采集群聊上下文；文件会直接提交到配置的 CNB 仓库，插件不会读取、扫描或脱敏内容。Issue 创建后，发起人明确 @机器人的群聊文字或白名单用户私信中的普通文字会作为评论写入 Issue。上传前请确认文件和补充文字中没有不应提交的内容。
-- 只支持单个 `.zip` 或 `.log` 文件；插件不读取文件内容。适配器必须向 AstrBot 提供可读取的 `File` URL 或本地文件路径。
-- 群文件 URL 仅允许 HTTP(S)，下载前和重定向后都会拒绝解析到内网或保留地址的主机；可配置域名白名单进一步收紧范围。不同 QQ / OneBot 实现的文件通知和链接有效期仍需部署实测。
-- Issue 正文不会包含 QQ 群号、QQ 用户号或 AstrBot 会话标识。插件本地数据库会保存用于任务路由的标识，见上方保留说明。
-- 回复作者必须先在目标 CNB 仓库中验证再配置。仅凭 UUID 标记不能通过校验；NPC 能否读取日志附件取决于 CNB NPC 的实际能力。
-- 不记录普通群消息，不读取群历史。旧配置中的 `context_message_limit` 和 `context_window_seconds` 已停用。
-
-## 官方接口依据
-
-- [AstrBot 消息事件](https://docs.astrbot.app/dev/star/guides/listen-message-event.html)
-- [AstrBot 主动消息](https://docs.astrbot.app/dev/star/guides/send-message.html)
-- [CNB OpenAPI 文档](https://docs.cnb.cool/zh/develops/openapi.html)（接口路径与请求字段应以目标 CNB 部署的 Swagger 为准）
-- [CNB NPC 文档](https://docs.cnb.cool/zh/build/npc.html)
-
-## 本地回归测试
-
-运行 `python3.12 -m unittest discover -s tests -v`。测试使用 AstrBot 接口替身和模拟 CNB 客户端，验证无 @ 命令、用户隔离、日志附件提交及不上传上下文；不会创建真实 Issue。
+- [配置说明](docs/configuration.md)：全部配置项、取值范围，以及旧版本升级说明
+- [工作流程](docs/how-it-works.md)：报障的各个阶段、状态、超时，以及插件重启后怎样恢复
+- [接口说明](docs/api.md)：用到的 CNB OpenAPI 与 AstrBot 接口，以及 NPC 回复的匹配规则
+- [隐私与安全](docs/privacy.md)：会提交哪些内容，本地保存哪些数据

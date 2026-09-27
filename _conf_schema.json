@@ -1,89 +1,147 @@
 {
   "group_whitelist": {
-    "description": "启用报障功能的 QQ 群号；留空时所有群均不启用。",
+    "description": "启用报障功能的 QQ 群号",
+    "hint": "留空时所有群均不启用。",
     "type": "list",
     "default": []
   },
   "private_whitelist": {
-    "description": "可选的私信用户 ID 白名单；留空时默认允许所有用户私信报障，填写后仅允许名单内用户。",
+    "description": "私信报障用户白名单（可选）",
+    "hint": "留空时允许所有用户私信报障；填写后仅允许名单内的平台用户 ID。",
     "type": "list",
     "default": []
   },
-  "cnb_api_endpoint": {
-    "description": "CNB OpenAPI 服务地址。",
-    "type": "string",
-    "default": "https://api.cnb.cool"
-  },
-  "cnb_web_endpoint": {
-    "description": "CNB 网页地址，用于生成 Issue 链接。",
-    "type": "string",
-    "default": "https://cnb.cool"
+  "reply_in_disabled_groups": {
+    "description": "在未启用的群里回复提示",
+    "hint": "关闭时，未启用群中的 /debug 不回复也不拦截，便于与其他插件的同名指令共存。",
+    "type": "bool",
+    "default": false
   },
   "cnb_repository": {
-    "description": "目标仓库路径，例如 group/repo。",
+    "description": "目标仓库路径",
+    "hint": "例如 group/repo。",
     "type": "string",
     "default": ""
   },
   "cnb_token": {
-    "description": "CNB 访问令牌，需要 repo-issue:rw、repo-notes:r、repo-notes:rw 权限。",
+    "description": "CNB 访问令牌",
+    "hint": "需要 repo-issue:rw、repo-notes:r、repo-notes:rw 权限。",
     "type": "string",
     "default": "",
     "secret": true,
     "obvious_hint": true
   },
   "npc_mention": {
-    "description": "Issue 评论中用于触发 NPC 的原文提及，必须是普通段落中的提及。",
+    "description": "触发 NPC 的提及文本",
+    "hint": "写入 Issue 评论普通段落中的原文提及，例如 @CodeBuddy。",
     "type": "string",
     "default": "@CodeBuddy"
   },
   "npc_author_ids": {
-    "description": "已在目标仓库验证过的 NPC 回复作者 ID。建议优先配置此项。",
+    "description": "NPC 回复作者 ID",
+    "hint": "已在目标仓库验证过的作者 ID，建议优先配置此项。",
     "type": "list",
     "default": []
   },
   "npc_author_usernames": {
-    "description": "已在目标仓库验证过的 NPC 回复作者 username，精确匹配。",
+    "description": "NPC 回复作者 username",
+    "hint": "已在目标仓库验证过的作者 username，精确匹配。",
     "type": "list",
     "default": ["CodeBuddy"]
   },
-  "log_wait_seconds": {
-    "description": "用户上传 ZIP 或 LOG 日志的等待时间，单位秒。",
-    "type": "int",
-    "default": 600
+  "assistant_name": {
+    "description": "对用户显示的分析助手名称",
+    "hint": "聊天消息和合并转发中用它代替 NPC 一词。",
+    "type": "string",
+    "default": "分析助手"
   },
-  "analysis_wait_seconds": {
-    "description": "等待 NPC 最终分析的最长时间，单位秒。",
-    "type": "int",
-    "default": 1200
+  "log_location_hint": {
+    "description": "日志位置提示（可选）",
+    "hint": "开始报障时附在提示中，告诉用户去哪里找日志，例如：日志在程序目录的 debug 文件夹中，可整个打包成 zip。",
+    "type": "text",
+    "default": ""
   },
-  "poll_interval_seconds": {
-    "description": "NPC 评论正常轮询间隔，单位秒；CNB 请求失败时会按此间隔递增退避。",
+  "log_wait_minutes": {
+    "description": "等待上传日志的时间（分钟）",
     "type": "int",
     "default": 10
   },
-  "max_archive_bytes": {
-    "description": "单个 ZIP 或 LOG 日志文件的最大体积，单位字节。",
+  "analysis_wait_minutes": {
+    "description": "等待分析结果的最长时间（分钟）",
     "type": "int",
-    "default": 20971520
+    "default": 20
+  },
+  "recovery_confirm_minutes": {
+    "description": "等待用户确认是否解决的时间（分钟）",
+    "hint": "超时后插件会在 Issue 留言说明未获确认，再自动关闭 Issue。",
+    "type": "int",
+    "default": 30
+  },
+  "max_log_file_mib": {
+    "description": "单个日志文件大小上限（MiB）",
+    "type": "int",
+    "default": 20
+  },
+  "poll_interval_seconds": {
+    "description": "查询分析结果的间隔（秒）",
+    "hint": "CNB 请求失败时会按此间隔递增退避，最长 120 秒。",
+    "type": "int",
+    "default": 10
+  },
+  "issue_check_interval_seconds": {
+    "description": "等待确认期间检查 Issue 状态的间隔（秒）",
+    "type": "int",
+    "default": 30
+  },
+  "cnb_api_endpoint": {
+    "description": "CNB OpenAPI 服务地址",
+    "type": "string",
+    "default": "https://api.cnb.cool"
+  },
+  "cnb_web_endpoint": {
+    "description": "CNB 网页地址",
+    "hint": "用于生成 Issue 链接。",
+    "type": "string",
+    "default": "https://cnb.cool"
   },
   "file_url_host_allowlist": {
-    "description": "可选的群文件或私信文件下载域名白名单；留空时仍会拒绝内网、保留地址和非 HTTP(S) 地址。",
+    "description": "日志文件下载域名白名单（可选）",
+    "hint": "留空时仍会拒绝内网、保留地址和非 HTTP(S) 地址。",
     "type": "list",
     "default": []
   },
   "max_delivery_attempts": {
-    "description": "向报障来源会话发送 NPC 分析转发失败时的最大尝试次数。",
+    "description": "分析结果转发的最大尝试次数",
     "type": "int",
     "default": 10
   },
   "delivery_send_timeout_seconds": {
-    "description": "单次向报障来源会话发送 NPC 分析转发的超时时间，超时后按最大尝试次数重试。",
+    "description": "单次转发分析结果的超时时间（秒）",
     "type": "int",
     "default": 30
   },
   "history_retention_days": {
-    "description": "已结束报障在本地 SQLite 中保留的天数；活跃任务不清理。",
+    "description": "已结束报障在本地保留的天数",
+    "hint": "活跃报障不清理。",
     "type": "int",
     "default": 90
+  },
+  "log_wait_seconds": {
+    "description": "已弃用，请使用 log_wait_minutes",
+    "type": "int",
+    "default": 600,
+    "invisible": true
+  },
+  "analysis_wait_seconds": {
+    "description": "已弃用，请使用 analysis_wait_minutes",
+    "type": "int",
+    "default": 1200,
+    "invisible": true
+  },
+  "max_archive_bytes": {
+    "description": "已弃用，请使用 max_log_file_mib",
+    "type": "int",
+    "default": 20971520,
+    "invisible": true
   }
 }

@@ -14,6 +14,8 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from .settings import format_bytes
+
 log = logging.getLogger("astrbot_plugin_cnb_bot")
 
 
@@ -81,15 +83,15 @@ def _copy_limited(
     with target.open("xb") as output:
         while True:
             if deadline is not None and time.monotonic() >= deadline:
-                raise FileInputError("下载群文件超时，请重新上传日志文件。")
+                raise FileInputError("下载日志文件超时，请重新上传。")
             chunk = source.read(min(64 * 1024, max_bytes - total + 1))
             if not chunk:
                 break
             if deadline is not None and time.monotonic() >= deadline:
-                raise FileInputError("下载群文件超时，请重新上传日志文件。")
+                raise FileInputError("下载日志文件超时，请重新上传。")
             total += len(chunk)
             if total > max_bytes:
-                raise FileInputError(f"日志文件超过大小限制（{max_bytes} 字节）。")
+                raise FileInputError(f"日志文件超过大小上限（{format_bytes(max_bytes)}），请压缩或只保留相关日志后重新上传。")
             output.write(chunk)
     return total
 
@@ -105,12 +107,12 @@ def _download_limited(url: str, target: Path, max_bytes: int, allowed_hosts: lis
             _validate_download_url(final_url, allowed_hosts)
             header_size = response.headers.get("Content-Length")
             if header_size and int(header_size) > max_bytes:
-                raise FileInputError(f"日志文件超过大小限制（{max_bytes} 字节）。")
+                raise FileInputError(f"日志文件超过大小上限（{format_bytes(max_bytes)}），请压缩或只保留相关日志后重新上传。")
             return _copy_limited(response, target, max_bytes, deadline)
     except FileInputError:
         raise
     except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
-        raise FileInputError("下载群文件失败，链接可能过期或平台不可达。") from exc
+        raise FileInputError("下载日志文件失败，文件链接可能已过期，请重新上传。") from exc
 
 
 def _component_name(component) -> str:
@@ -143,7 +145,7 @@ def stage_log_file(
     name = _component_name(component)
     suffix = Path(name).suffix.lower()
     if suffix not in {".zip", ".log"}:
-        raise FileInputError("目前只接受 .zip 或 .log 日志文件。")
+        raise FileInputError("只接受 .zip 或 .log 日志文件，请重新上传。")
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
         destination.unlink()
@@ -155,16 +157,16 @@ def stage_log_file(
         try:
             info = source_path.lstat()
         except OSError as exc:
-            raise FileInputError("平台返回的群文件已不存在。") from exc
+            raise FileInputError("日志文件已失效，请重新上传。") from exc
         if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
-            raise FileInputError("平台返回的群文件不是普通文件。")
+            raise FileInputError("无法读取这个日志文件，请重新上传。")
         if info.st_size > max_bytes:
-            raise FileInputError(f"日志文件超过大小限制（{max_bytes} 字节）。")
+            raise FileInputError(f"日志文件超过大小上限（{format_bytes(max_bytes)}），请压缩或只保留相关日志后重新上传。")
         try:
             with source_path.open("rb") as source:
                 byte_count = _copy_limited(source, destination, max_bytes)
         except OSError as exc:
-            raise FileInputError("读取平台返回的群文件失败。") from exc
+            raise FileInputError("读取日志文件失败，请重新上传。") from exc
     elif url:
         # AstrBot adapters often expose both a local file_ and a remote url.
         # Reuse the downloaded local copy when available so QQ/CDN URL fetches
@@ -172,7 +174,7 @@ def stage_log_file(
         log.info("报障日志文件没有可用的本地副本，正在下载适配器提供的文件 URL。")
         byte_count = _download_limited(url, destination, max_bytes, allowed_hosts)
     elif source_path:
-        raise FileInputError("平台返回的群文件已不存在。")
+        raise FileInputError("日志文件已失效，请重新上传。")
     else:
         raise FileInputError("此 QQ 适配器没有提供可读取的群文件 URL 或本地文件。")
 

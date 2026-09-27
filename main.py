@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
+import re
 import time
 import uuid
 from pathlib import Path
@@ -12,8 +14,36 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
-from .jobs import ReportJobs, STATUS_LABELS
+from .jobs import ReportJobs, status_label
+from .settings import assistant_name, format_duration, log_wait_seconds
 from .storage import ACTIVE_STATUSES, TaskStore
+
+SUBCOMMANDS = {
+    "start": {"start", "new", "开始"},
+    "help": {"help", "帮助", "?", "？"},
+    "analyze": {"analyze", "分析", "重新分析"},
+    "status": {"status", "状态"},
+    "resolve": {"resolve", "resolved", "恢复", "已恢复", "解决", "已解决"},
+    "cancel": {"cancel", "取消"},
+}
+_ENGLISH_SUBCOMMANDS = ["help", "analyze", "status", "resolve", "cancel"]
+
+
+def _subcommand(argument: str) -> str:
+    lowered = argument.strip().lower()
+    for name, aliases in SUBCOMMANDS.items():
+        if lowered in aliases:
+            return name
+    return ""
+
+
+def _likely_typo(argument: str) -> str:
+    """Return the subcommand a single-word argument most likely misspells."""
+    word = argument.strip().lower()
+    if not re.fullmatch(r"[a-z]{3,12}", word):
+        return ""
+    matches = difflib.get_close_matches(word, _ENGLISH_SUBCOMMANDS, n=1, cutoff=0.6)
+    return matches[0] if matches else ""
 
 
 def _component_type(component: Any) -> str:
@@ -143,43 +173,46 @@ class CNBReportPlugin(Star):
         scope = _event_scope(event)
         if not scope:
             return
-        event.stop_event()
         private = _is_private_message(event)
         if private:
             if not _private_user_allowed(self.config, scope[3]):
+                event.stop_event()
                 yield event.plain_result("此账号未获准使用私信报障，请联系管理员调整私信白名单。")
                 return
         elif scope[2] not in set(_as_string_list(self.config.get("group_whitelist", []))):
-            yield event.plain_result("此群未启用报障功能，请联系管理员配置群白名单。")
+            # Stay silent by default so another plugin's /debug still works here.
+            if self.config.get("reply_in_disabled_groups", False):
+                event.stop_event()
+                yield event.plain_result("此群未启用报障功能，请联系管理员配置群白名单。")
             return
+        event.stop_event()
         argument = _debug_argument(event, action)
-        if not argument:
+        command = _subcommand(argument) if argument else ""
+        platform_name, bot_id, group_id, sender_id = scope
+        if not argument or command == "start":
             response = self._start_report(scope, str(event.unified_msg_origin))
-        elif argument.lower() == "analyze":
+        elif command == "help":
+            response = self._help_text(private)
+        elif command == "analyze":
             task = self.store.find_current(*scope)
             if task:
-                platform_name, bot_id, group_id, sender_id = scope
                 _, response = await self.jobs.request_npc_analysis(
                     task["id"], sender_id, platform_name, bot_id, group_id
                 )
             else:
-                response = "当前没有可重新分析的报障。"
-        elif argument.lower() in {"status", "状态"}:
+                response = "你在这里还没有报障，请先发送 /debug 开始。"
+        elif command == "status":
             task = self.store.find_current(*scope)
             if task:
                 task = await self.jobs.refresh_task(task["id"], notify=False) or task
                 task = self.store.get(task["id"]) or task
-                if task["status"] == "WAITING_NPC" and task.get("last_poll_error"):
-                    response = "已刷新完整报障状态；刚刚查询 CNB 评论失败，插件会自动重试。\n" + self._format_status(task)
-                else:
-                    response = "已刷新完整报障状态。\n" + self._format_status(task)
+                response = self.jobs.format_status(task)
             else:
-                response = "你在此会话还没有报障，请发送 /debug 开始。"
-        elif argument.lower() in {"resolve", "resolved", "恢复", "已恢复"}:
+                response = "你在这里还没有报障，请先发送 /debug 开始。"
+        elif command == "resolve":
             task = self.store.find_current(*scope)
             if task:
                 previous_status = str(task.get("status", ""))
-                platform_name, bot_id, group_id, sender_id = scope
                 _, response = await self.jobs.confirm_recovery(
                     task["id"], sender_id, platform_name, bot_id, group_id
                 )
@@ -192,14 +225,20 @@ class CNBReportPlugin(Star):
                     # _finish already sent the completion notice with a mention.
                     response = ""
             else:
-                response = "你在此会话还没有报障。"
-        elif argument.lower() in {"cancel", "取消"}:
+                response = "你在这里还没有报障。"
+        elif command == "cancel":
             task = self.store.find_current(*scope)
             if task:
-                platform_name, bot_id, group_id, sender_id = scope
                 _, response = self.jobs.cancel(task["id"], sender_id, platform_name, bot_id, group_id)
             else:
-                response = "你在此会话还没有报障。"
+                response = "你在这里还没有报障。"
+        elif _likely_typo(argument):
+            guess = _likely_typo(argument)
+            response = (
+                f"没有 /debug {argument.strip()} 这个指令，你是不是想发送 /debug {guess}？\n"
+                "如果这是故障描述，请写得更具体一些，例如：/debug 启动后闪退。\n"
+                "发送 /debug help 查看全部指令。"
+            )
         else:
             title = " ".join(argument.split())
             response = self._start_report(
@@ -251,7 +290,7 @@ class CNBReportPlugin(Star):
                 return
             if len(incoming_files) != 1:
                 event.stop_event()
-                return "每个报障任务只接收一个 .zip 或 .log 文件，请只发送一个日志文件。"
+                return "每次报障只接收一个 .zip 或 .log 文件，请只发送一个日志文件。"
             if not self.store.claim_waiting_log(waiting["id"], scope[3]):
                 return
             event.stop_event()
@@ -259,7 +298,7 @@ class CNBReportPlugin(Star):
             # attachment processing before yielding; send the receipt directly.
             try:
                 await asyncio.wait_for(
-                    event.send(event.plain_result("已收到日志文件，正在准备上传 CNB。")),
+                    event.send(event.plain_result("已收到日志，正在提交，请稍候…")),
                     timeout=10,
                 )
             except Exception:
@@ -268,7 +307,8 @@ class CNBReportPlugin(Star):
             if not ok:
                 latest = self.store.get(waiting["id"])
                 if latest and latest["status"] == "WAITING_LOG":
-                    response += "\n请在等待时限内重新上传 .zip 或 .log 文件，或使用 /debug cancel 结束报障。"
+                    remaining = format_duration(float(latest.get("deadline", 0)) - time.time())
+                    response += f"\n请在 {remaining}内重新上传，或发送 /debug cancel 取消报障。"
             return response
 
         if not private and not _mentions_bot(event, scope[1]):
@@ -283,15 +323,15 @@ class CNBReportPlugin(Star):
             return
         event.stop_event()
         if not private and not text:
-            response = "请在 @机器人 后附上要写入 CNB Issue 评论的补充文字。"
+            response = "请在 @我 的同一条消息里写上要补充的文字，它会作为评论写入 Issue。"
         elif not task.get("issue_number"):
             response = (
-                "当前 Issue 尚未创建；创建后再私信发送补充说明。"
+                "Issue 还没创建好，请稍后再直接私信发送补充信息。"
                 if private
-                else "当前 Issue 尚未创建；创建后再 @机器人发送补充说明。"
+                else "Issue 还没创建好，请稍后再 @我 发送补充信息。"
             )
         elif task.get("status") == "CLOSING_ISSUE":
-            response = "此报障正在关闭 Issue，暂时不能追加评论。"
+            response = "报障正在结束，这条补充信息没有提交。"
         else:
             ok, response = await self.jobs.append_issue_comment(task["id"], text)
         return response
@@ -320,6 +360,7 @@ class CNBReportPlugin(Star):
             return "插件配置尚未完成：" + "、".join(missing) + "。请联系管理员配置后再试。"
 
         platform_name, bot_id, group_id, sender_id = scope
+        wait_seconds = log_wait_seconds(self.config)
         task = {
             "id": str(uuid.uuid4()),
             "active_key": f"{platform_name}:{bot_id}:{group_id}:{sender_id}",
@@ -328,51 +369,43 @@ class CNBReportPlugin(Star):
             "group_id": group_id,
             "user_id": sender_id,
             "unified_msg_origin": unified_msg_origin,
-            "deadline": time.time() + int(self.config.get("log_wait_seconds", 600)),
+            "deadline": time.time() + wait_seconds,
             "repository": str(self.config.get("cnb_repository", "")).strip().strip("/"),
             "issue_title": issue_title,
         }
         created, existing = self.store.create_waiting(task)
         if not created and existing:
-            label = STATUS_LABELS.get(existing["status"], existing["status"])
-            return f"你在此会话已有未结束的报障（{label}）。\n使用 /debug status 查询，或 /debug cancel 取消。"
-        title_line = f"Issue 标题：{issue_title}\n" if issue_title else ""
-        private = not group_id
-        place = "本私信会话" if private else "本群"
-        supplement_hint = (
-            "Issue 创建后，可直接私信发送补充信息，文字会成为 Issue 评论。\n"
-            if private
-            else "Issue 创建后，可 @机器人把补充信息发送为 Issue 评论。\n"
-        )
-        return (
-            f"已开始报障。\n{title_line}"
-            f"请在 {max(1, int(self.config.get('log_wait_seconds', 600)) // 60)} 分钟内，在{place}用当前账号上传一个 .zip 或 .log 日志文件。\n"
-            f"{supplement_hint}"
-            "仅提交原始文件，不采集聊天上下文；不会读取或脱敏文件内容。\n"
-            "使用 /debug status 查询，或 /debug cancel 取消。"
-        )
-
-    @staticmethod
-    def _format_status(task: dict[str, Any]) -> str:
-        label = STATUS_LABELS.get(task["status"], task["status"])
-        lines = [f"状态：{label}"]
-        if task.get("issue_url"):
-            lines.append(f"Issue：{task['issue_url']}")
-            issue_state = task.get("issue_state")
-            if issue_state:
-                lines.append(f"Issue 状态：{'已关闭' if issue_state == 'closed' else '打开'}")
-        if task.get("last_error"):
-            lines.append(f"说明：{task['last_error']}")
-        if task.get("status") == "AWAITING_RECOVERY":
-            if task.get("analysis_summary"):
-                lines.append(f"结论：{task['analysis_summary']}")
-            lines.append("请在 5 分钟内发送 /debug resolve；超时后 CNB Issue 会自动关闭。")
-        if task.get("status") in {"AWAITING_RECOVERY", "CLOSING_ISSUE"} and task.get("last_issue_error"):
-            lines.append(f"Issue 状态同步遇到问题，插件会自动重试：{task['last_issue_error']}")
-        if task.get("status") == "DELIVERING" and task.get("last_delivery_error"):
-            lines.append(
-                f"最近一次转发发送失败：{task['last_delivery_error']}；插件会自动重试。"
+            return (
+                f"你在这里已有一个未结束的报障（{status_label(existing)}）。\n"
+                "发送 /debug status 查看进度，或 /debug cancel 取消后重新开始。"
             )
-        if task.get("status") == "UNCERTAIN" and task.get("uncertain_kind") == "issue_creation":
-            lines.append(f"请管理员在 CNB 核对内部追踪编号 {task['id']}；插件不会自动重复创建。")
+        private = not group_id
+        lines = [
+            f"请在 {format_duration(wait_seconds)}内"
+            + ("" if private else "由你本人在本群")
+            + "上传一个 .zip 或 .log 日志文件。"
+        ]
+        hint = str(self.config.get("log_location_hint", "") or "").strip()
+        if hint:
+            lines.append(hint)
+        if issue_title:
+            lines.append(f"Issue 标题：{issue_title}")
+        how = "直接私信" if private else "@我"
+        lines.append(
+            f"上传后会创建 Issue 并请{assistant_name(self.config)}分析；之后可{how}补充信息。"
+        )
+        lines.append("注意：文件会原样提交到 CNB 仓库，不会读取或脱敏，请确认不含隐私内容。")
+        lines.append("/debug cancel 取消 · /debug help 查看帮助")
         return "\n".join(lines)
+
+    def _help_text(self, private: bool) -> str:
+        how = "直接私信我" if private else "@我"
+        return (
+            "报障指令：\n"
+            "/debug [故障描述] 开始报障，描述会作为 Issue 标题\n"
+            "/debug status 查看进度\n"
+            f"/debug analyze 补充信息后请{assistant_name(self.config)}重新分析\n"
+            "/debug resolve 确认问题已解决\n"
+            "/debug cancel 取消报障\n"
+            f"Issue 创建后，{how}发送文字即可补充到 Issue。"
+        )

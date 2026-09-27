@@ -149,7 +149,7 @@ def release_notes(tag: str, previous_tag: str | None) -> str:
 
 def plugin_files(tag: str) -> list[str]:
     paths = git("ls-tree", "-r", "--name-only", tag).splitlines()
-    excluded_dirs = {".github", "scripts", "tests", "dist"}
+    excluded_dirs = {".github", "docs", "scripts", "tests", "dist"}
     excluded_names = {".env", ".DS_Store", ".gitignore", "CHANGELOG.md"}
     files = []
     for path in paths:
