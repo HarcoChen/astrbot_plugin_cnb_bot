@@ -1,0 +1,84 @@
+{
+  "group_whitelist": {
+    "description": "启用报障功能的 QQ 群号；留空时所有群均不启用。",
+    "type": "list",
+    "default": []
+  },
+  "cnb_api_endpoint": {
+    "description": "CNB OpenAPI 服务地址。",
+    "type": "string",
+    "default": "https://api.cnb.cool"
+  },
+  "cnb_web_endpoint": {
+    "description": "CNB 网页地址，用于生成 Issue 链接。",
+    "type": "string",
+    "default": "https://cnb.cool"
+  },
+  "cnb_repository": {
+    "description": "目标仓库路径，例如 group/repo。",
+    "type": "string",
+    "default": ""
+  },
+  "cnb_token": {
+    "description": "CNB 访问令牌，需要 repo-issue:rw、repo-notes:r、repo-notes:rw 权限。",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "obvious_hint": true
+  },
+  "npc_mention": {
+    "description": "Issue 评论中用于触发 NPC 的原文提及，必须是普通段落中的提及。",
+    "type": "string",
+    "default": "@CodeBuddy"
+  },
+  "npc_author_ids": {
+    "description": "已在目标仓库验证过的 NPC 回复作者 ID。建议优先配置此项。",
+    "type": "list",
+    "default": []
+  },
+  "npc_author_usernames": {
+    "description": "已在目标仓库验证过的 NPC 回复作者 username，精确匹配。",
+    "type": "list",
+    "default": ["CodeBuddy"]
+  },
+  "log_wait_seconds": {
+    "description": "用户上传 ZIP 日志的等待时间，单位秒。",
+    "type": "int",
+    "default": 600
+  },
+  "analysis_wait_seconds": {
+    "description": "等待 NPC 最终分析的最长时间，单位秒。",
+    "type": "int",
+    "default": 1200
+  },
+  "poll_interval_seconds": {
+    "description": "NPC 评论轮询的初始间隔，单位秒。",
+    "type": "int",
+    "default": 10
+  },
+  "max_archive_bytes": {
+    "description": "ZIP 文件最大压缩体积，单位字节。",
+    "type": "int",
+    "default": 20971520
+  },
+  "file_url_host_allowlist": {
+    "description": "可选的群文件下载域名白名单；留空时仍会拒绝内网、保留地址和非 HTTP(S) 地址。",
+    "type": "list",
+    "default": []
+  },
+  "max_delivery_attempts": {
+    "description": "向原群发送 NPC 分析转发失败时的最大尝试次数。",
+    "type": "int",
+    "default": 10
+  },
+  "delivery_send_timeout_seconds": {
+    "description": "单次向原群发送 NPC 分析转发的超时时间，超时后按最大尝试次数重试。",
+    "type": "int",
+    "default": 30
+  },
+  "history_retention_days": {
+    "description": "已结束报障在本地 SQLite 中保留的天数；活跃任务不清理。",
+    "type": "int",
+    "default": 90
+  }
+}
