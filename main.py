@@ -63,6 +63,12 @@ def _as_string_list(value: Any) -> list[str]:
     return []
 
 
+def _private_user_allowed(config: dict[str, Any], sender_id: str) -> bool:
+    """An empty private allowlist leaves the private entry point open."""
+    allowed_users = _as_string_list(config.get("private_whitelist", []))
+    return not allowed_users or str(sender_id) in set(allowed_users)
+
+
 def _is_private_message(event: AstrMessageEvent) -> bool:
     checker = getattr(event, "is_private_chat", None)
     if callable(checker):
@@ -140,8 +146,8 @@ class CNBReportPlugin(Star):
         event.stop_event()
         private = _is_private_message(event)
         if private:
-            if scope[3] not in set(_as_string_list(self.config.get("private_whitelist", []))):
-                yield event.plain_result("未启用私信报障，请联系管理员将你的 QQ 号加入私信白名单。")
+            if not _private_user_allowed(self.config, scope[3]):
+                yield event.plain_result("此账号未获准使用私信报障，请联系管理员调整私信白名单。")
                 return
         elif scope[2] not in set(_as_string_list(self.config.get("group_whitelist", []))):
             yield event.plain_result("此群未启用报障功能，请联系管理员配置群白名单。")
@@ -223,7 +229,7 @@ class CNBReportPlugin(Star):
         if (
             not scope
             or not _is_private_message(event)
-            or scope[3] not in set(_as_string_list(self.config.get("private_whitelist", [])))
+            or not _private_user_allowed(self.config, scope[3])
         ):
             return
         response = await self._handle_report_message(event, scope, private=True)

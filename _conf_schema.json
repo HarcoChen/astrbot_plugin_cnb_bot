@@ -5,7 +5,7 @@
     "default": []
   },
   "private_whitelist": {
-    "description": "允许私信报障的 QQ 用户号；留空时不启用私信入口。",
+    "description": "可选的私信用户 ID 白名单；留空时默认允许所有用户私信报障，填写后仅允许名单内用户。",
     "type": "list",
     "default": []
   },

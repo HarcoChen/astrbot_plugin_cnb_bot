@@ -1,12 +1,12 @@
 # AstrBot CNB 报障助手
 
-AstrBot 插件：在白名单 QQ 群或白名单私信用户中由用户发送 `/debug` 发起报障，接收原始 ZIP 或 LOG 日志，创建 CNB Issue，再跟踪已验证身份的 CNB NPC 最终回复并合并转发回报障来源会话。
+AstrBot 插件：用户在已启用的群或私信中发送 `/debug` 发起报障，接收原始 ZIP 或 LOG 日志，创建 CNB Issue，再跟踪已验证身份的 CNB NPC 最终回复并转发回报障来源会话。
 
-当前版本面向 AstrBot 4.16–4.x 和 `aiocqhttp`（OneBot v11）平台。群聊和私信均可报障，私信需管理员将 QQ 号加入白名单。文件接收依赖适配器提供的 File 消息；NPC 作者字段应按目标仓库实际回复配置。
+当前接入目标为 AstrBot 4.16–4.x 和 `aiocqhttp`（OneBot v11）。群聊需配置群白名单；私信默认允许所有用户，只有配置 `private_whitelist` 后才限制为名单中的平台用户 ID。任务按平台、机器人、会话和用户标识隔离，便于接入其他平台；文件接收和详细分析转发仍取决于适配器的能力。NPC 作者字段应按目标仓库实际回复配置。
 
 ## 用户指令
 
-斜线命令无需 @机器人或 UUID；故障描述可选。群聊命令只在群白名单内生效；私信命令只对私信白名单中的用户开放。AstrBot 的唤醒前缀需包含 `/`（默认配置）。
+斜线命令无需 @机器人或 UUID；故障描述可选。群聊命令只在群白名单内生效；私信命令默认开放，也可通过私信白名单限制。AstrBot 的唤醒前缀需包含 `/`（默认配置）。
 
 ```text
 /debug
@@ -32,7 +32,7 @@ AstrBot 插件：在白名单 QQ 群或白名单私信用户中由用户发送 `
 | 配置 | 必填 | 说明 |
 | --- | --- | --- |
 | `group_whitelist` | 群聊报障时必填 | 启用功能的 QQ 群号列表。留空表示不启用任何群。 |
-| `private_whitelist` | 私信报障时必填 | 允许私信报障的 QQ 用户号列表。留空表示私信入口关闭。 |
+| `private_whitelist` | 否 | 可选的平台用户 ID 白名单。留空时所有用户均可私信报障；填写后仅允许名单内用户。 |
 | `cnb_repository` | 是 | CNB 仓库路径，例如 `group/repo`。 |
 | `cnb_token` | 是 | CNB 访问令牌；需要 Issue 写入和评论读写权限（`repo-issue:rw`、`repo-notes:r`、`repo-notes:rw`）。 |
 | `npc_mention` | 是 | CNB Issue 评论中真实可触发 NPC 的提及文本，默认 `@CodeBuddy`。 |
