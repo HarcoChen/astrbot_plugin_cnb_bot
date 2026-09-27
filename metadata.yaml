@@ -1,7 +1,7 @@
 name: astrbot_plugin_cnb_bot
 display_name: CNB 报障助手
 desc: 通过群聊或私信 /debug 提交日志，创建 CNB Issue 并转发已验证的 NPC 分析结果。
-version: 0.2.0
+version: 0.3.1
 author: harcochen
 repo: "https://github.com/HarcoChen/astrbot_plugin_cnb_bot"
 astrbot_version: ">=4.16,<5"
