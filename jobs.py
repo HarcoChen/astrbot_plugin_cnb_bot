@@ -12,13 +12,13 @@ from typing import Any
 from astrbot.api import logger as log
 
 from .cnb_client import CNBAPIError, CNBClient, CNBNetworkError
-from .qq_files import FileInputError, stage_zip_file
+from .qq_files import FileInputError, stage_log_file
 from .storage import ACTIVE_STATUSES, TaskStore, TERMINAL_STATUSES
 
 STATUS_LABELS = {
     "WAITING_LOG": "等待日志上传",
-    "PREPARING_LOG": "正在准备上传 ZIP",
-    "CREATING_ISSUE": "正在上传 ZIP 并创建 CNB Issue",
+    "PREPARING_LOG": "正在准备上传日志",
+    "CREATING_ISSUE": "正在上传日志并创建 CNB Issue",
     "TRIGGERING_NPC": "正在请求 NPC 分析",
     "WAITING_NPC": "等待 NPC 最终分析",
     "DELIVERING": "正在发送 NPC 分析转发",
@@ -122,6 +122,15 @@ class ReportJobs:
             token=str(self.config.get("cnb_token", "")),
         )
 
+    def _cleanup_temp_files(self, task_id: str) -> None:
+        for suffix in (".upload", ".zip", ".log"):
+            (self.temp_dir / f"{task_id}{suffix}").unlink(missing_ok=True)
+
+    def _cleanup_prepared_candidates(self, task_id: str) -> None:
+        # .txt and .zip are retained for cleanup of files left by older builds.
+        for suffix in (".txt", ".zip", ".log"):
+            (self.prepared_dir / f"{task_id}{suffix}").unlink(missing_ok=True)
+
     def validate_configuration(self) -> None:
         self._client()
         if not str(self.config.get("npc_mention", "")).strip():
@@ -171,7 +180,7 @@ class ReportJobs:
             elif status == "PREPARING_LOG":
                 prepared = task.get("prepared_path")
                 if prepared and Path(prepared).is_file():
-                    (self.temp_dir / f"{task['id']}.zip").unlink(missing_ok=True)
+                    self._cleanup_temp_files(str(task["id"]))
                     self.store.update(
                         task["id"],
                         status="CREATING_ISSUE",
@@ -180,29 +189,27 @@ class ReportJobs:
                     )
                     asyncio.create_task(self._create_issue_from_prepared(task["id"]))
                 elif float(task["deadline"]) > now:
-                    (self.temp_dir / f"{task['id']}.zip").unlink(missing_ok=True)
-                    (self.prepared_dir / f"{task['id']}.txt").unlink(missing_ok=True)
-                    (self.prepared_dir / f"{task['id']}.zip").unlink(missing_ok=True)
+                    self._cleanup_temp_files(str(task["id"]))
+                    self._cleanup_prepared_candidates(str(task["id"]))
                     self.store.update(
                         task["id"],
                         status="WAITING_LOG",
-                        fields={"last_error": "上次准备 ZIP 上传时被中断，请重新上传。"},
+                        fields={"last_error": "上次准备日志上传时被中断，请重新上传。"},
                         expected_statuses={"PREPARING_LOG"},
                     )
                     await self._notify(
                         task,
-                        f"报障 {task['id']} 的 ZIP 上传准备在重启时中断，请在原等待时限内重新上传。",
+                        f"报障 {task['id']} 的日志上传准备在重启时中断，请在原等待时限内重新上传。",
                     )
                 else:
-                    (self.temp_dir / f"{task['id']}.zip").unlink(missing_ok=True)
-                    (self.prepared_dir / f"{task['id']}.txt").unlink(missing_ok=True)
-                    (self.prepared_dir / f"{task['id']}.zip").unlink(missing_ok=True)
+                    self._cleanup_temp_files(str(task["id"]))
+                    self._cleanup_prepared_candidates(str(task["id"]))
                     await self._finish(task, "EXPIRED", "重启后日志上传等待时间已到。")
             elif status == "CREATING_ISSUE":
                 phase = task.get("external_phase", "prepared")
                 if phase in {"prepared", "asset_upload", "asset_uploaded"} and task.get("prepared_path"):
                     if Path(task["prepared_path"]).is_file():
-                        (self.temp_dir / f"{task['id']}.zip").unlink(missing_ok=True)
+                        self._cleanup_temp_files(str(task["id"]))
                         asyncio.create_task(self._create_issue_from_prepared(task["id"]))
                         continue
                 self.store.update(
@@ -412,22 +419,21 @@ class ReportJobs:
                 return
 
             now = time.time()
-            (self.temp_dir / f"{task_id}.zip").unlink(missing_ok=True)
-            (self.prepared_dir / f"{task_id}.txt").unlink(missing_ok=True)
-            (self.prepared_dir / f"{task_id}.zip").unlink(missing_ok=True)
+            self._cleanup_temp_files(task_id)
+            self._cleanup_prepared_candidates(task_id)
             if float(task.get("deadline", 0)) <= now:
                 await self._finish(task, "EXPIRED", "等待日志上传超时。")
                 return
             updated = self.store.update(
                 task_id,
                 status="WAITING_LOG",
-                fields={"last_error": "上次准备 ZIP 上传时被中断，请重新上传。"},
+                fields={"last_error": "上次准备日志上传时被中断，请重新上传。"},
                 expected_statuses={"PREPARING_LOG"},
             )
             if updated and updated.get("status") == "WAITING_LOG":
                 await self._notify(
                     updated,
-                    f"报障 {task_id} 的 ZIP 上传准备已中断，请在原等待时限内重新上传。",
+                    f"报障 {task_id} 的日志上传准备已中断，请在原等待时限内重新上传。",
                 )
 
     async def _refresh_triggering_npc(self, task_id: str) -> None:
@@ -488,29 +494,29 @@ class ReportJobs:
             task = self.store.get(task_id)
             if not task or task["status"] != "PREPARING_LOG":
                 return False, "这份日志已处理，或对应报障任务已失效。"
-            archive_path = self.temp_dir / f"{task_id}.zip"
-            prepared_path = self.prepared_dir / f"{task_id}.zip"
-            legacy_prepared_path = self.prepared_dir / f"{task_id}.txt"
-            archive_path.unlink(missing_ok=True)
-            prepared_path.unlink(missing_ok=True)
-            legacy_prepared_path.unlink(missing_ok=True)
+            staged_destination = self.temp_dir / f"{task_id}.upload"
+            prepared_path: Path | None = None
+            self._cleanup_temp_files(task_id)
+            self._cleanup_prepared_candidates(task_id)
             try:
-                log.info("报障 %s 开始暂存原始 ZIP。", task_id)
-                staged_path, source_name, archive_bytes = await asyncio.to_thread(
-                    stage_zip_file,
+                log.info("报障 %s 开始暂存原始日志文件。", task_id)
+                staged_path, source_name, file_bytes = await asyncio.to_thread(
+                    stage_log_file,
                     component,
-                    archive_path,
+                    staged_destination,
                     int(self.config.get("max_archive_bytes", 20 * 1024 * 1024)),
                     sorted(self._config_values(self.config.get("file_url_host_allowlist", []))),
                 )
-                log.info("报障 %s 原始 ZIP 已暂存（%s 字节），准备上传 CNB。", task_id, archive_bytes)
+                source_suffix = Path(source_name).suffix.lower()
+                prepared_path = self.prepared_dir / f"{task_id}{source_suffix}"
+                log.info("报障 %s 原始日志文件已暂存（%s 字节），准备上传 CNB。", task_id, file_bytes)
                 current = self.store.get(task_id)
                 if not current or current["status"] != "PREPARING_LOG":
                     prepared_path.unlink(missing_ok=True)
                     return False, "报障任务已取消。"
                 staged_path.replace(prepared_path)
                 summary_json = {
-                    "archive_bytes": archive_bytes,
+                    "file_bytes": file_bytes,
                     "source_filename": source_name,
                 }
                 self.store.update(
@@ -522,7 +528,7 @@ class ReportJobs:
                         "source_filename": source_name,
                         "key_log_excerpt": "",
                         "last_archive_sha256": "",
-                        "source_file_suffix": ".zip",
+                        "source_file_suffix": source_suffix,
                         "external_phase": "prepared",
                     },
                     expected_statuses={"PREPARING_LOG"},
@@ -532,8 +538,9 @@ class ReportJobs:
                     prepared_path.unlink(missing_ok=True)
                     return False, "报障任务已取消。"
             except FileInputError as exc:
-                archive_path.unlink(missing_ok=True)
-                prepared_path.unlink(missing_ok=True)
+                self._cleanup_temp_files(task_id)
+                if prepared_path:
+                    prepared_path.unlink(missing_ok=True)
                 current = self.store.get(task_id)
                 if current and current["status"] == "PREPARING_LOG":
                     self.store.update(
@@ -544,20 +551,21 @@ class ReportJobs:
                     )
                 return False, str(exc)
             except Exception as exc:
-                log.exception("准备原始 ZIP 附件失败，报障编号 %s", task_id)
-                archive_path.unlink(missing_ok=True)
-                prepared_path.unlink(missing_ok=True)
+                log.exception("准备原始日志附件失败，报障编号 %s", task_id)
+                self._cleanup_temp_files(task_id)
+                if prepared_path:
+                    prepared_path.unlink(missing_ok=True)
                 current = self.store.get(task_id)
                 if current and current["status"] == "PREPARING_LOG":
                     self.store.update(
                         task_id,
                         status="WAITING_LOG",
-                        fields={"last_error": "准备 ZIP 附件时发生异常，请重新上传。"},
+                        fields={"last_error": "准备日志附件时发生异常，请重新上传。"},
                         expected_statuses={"PREPARING_LOG"},
                     )
-                return False, "准备 ZIP 附件时发生异常，请检查插件日志后重新上传。"
+                return False, "准备日志附件时发生异常，请检查插件日志后重新上传。"
             finally:
-                archive_path.unlink(missing_ok=True)
+                self._cleanup_temp_files(task_id)
 
         await self._create_issue_from_prepared(task_id, notify_issue_created=False)
         updated = self.store.get(task_id)
@@ -585,7 +593,7 @@ class ReportJobs:
                 client = self._client(str(task.get("repository", "")))
                 asset = task.get("uploaded_asset")
                 if not asset:
-                    log.info("报障 %s 开始将原始 ZIP 上传到 CNB。", task_id)
+                    log.info("报障 %s 开始将原始日志文件上传到 CNB。", task_id)
                     self.store.update(
                         task_id,
                         fields={"external_phase": "asset_upload"},
@@ -596,7 +604,7 @@ class ReportJobs:
                         prepared_path,
                         str(task.get("source_filename", "")),
                     )
-                    log.info("报障 %s 原始 ZIP 已上传到 CNB。", task_id)
+                    log.info("报障 %s 原始日志文件已上传到 CNB。", task_id)
                     self.store.update(
                         task_id,
                         fields={"external_phase": "asset_uploaded", "uploaded_asset": asset},
@@ -608,7 +616,7 @@ class ReportJobs:
                     return
                 summary = current.get("attachment_summary", {})
                 body = self._issue_body(current, asset, summary)
-                title = str(current.get("issue_title") or "[Debug] ZIP 日志分析")
+                title = str(current.get("issue_title") or "[Debug] 日志分析")
                 self.store.update(
                     task_id,
                     fields={"external_phase": "issue_create"},
@@ -902,13 +910,19 @@ class ReportJobs:
         summary: dict[str, Any],
     ) -> str:
         attachment = str(asset.get("asset_link", ""))
+        suffix = str(task.get("source_file_suffix") or "").lower()
+        if not suffix:
+            suffix = Path(str(task.get("source_filename") or "")).suffix.lower()
+        file_type = "ZIP" if suffix == ".zip" else "LOG"
+        file_bytes = summary.get("file_bytes", summary.get("archive_bytes", 0))
         # Ignore legacy descriptions/snapshots too, including reports recovered
         # from the previous version. Only the attachment goes to CNB.
         return (
-            "## ZIP 日志附件\n"
+            "## 原始日志附件\n"
             f"{attachment}\n\n"
-            f"压缩文件大小：{summary.get('archive_bytes', 0)} 字节\n"
-            "插件未解压、扫描或脱敏 ZIP 内容。\n\n"
+            f"文件类型：{file_type}\n"
+            f"文件大小：{file_bytes} 字节\n"
+            "插件直接上传原始文件，不读取、扫描或脱敏文件内容。\n\n"
             f"内部追踪编号：`{task['id']}`"
         )
 

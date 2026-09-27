@@ -42,7 +42,7 @@
     "default": ["CodeBuddy"]
   },
   "log_wait_seconds": {
-    "description": "用户上传 ZIP 日志的等待时间，单位秒。",
+    "description": "用户上传 ZIP 或 LOG 日志的等待时间，单位秒。",
     "type": "int",
     "default": 600
   },
@@ -57,7 +57,7 @@
     "default": 10
   },
   "max_archive_bytes": {
-    "description": "ZIP 文件最大压缩体积，单位字节。",
+    "description": "单个 ZIP 或 LOG 日志文件的最大体积，单位字节。",
     "type": "int",
     "default": 20971520
   },

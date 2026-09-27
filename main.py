@@ -1,4 +1,4 @@
-"""AstrBot /debug commands and ZIP attachment handling."""
+"""AstrBot /debug commands and log attachment handling."""
 
 from __future__ import annotations
 
@@ -60,7 +60,7 @@ def _debug_argument(event: AstrMessageEvent, parsed_action: str) -> str:
 @register(
     "astrbot_plugin_cnb_bot",
     "harco",
-    "通过 /debug 提交原始 ZIP 日志，创建 CNB Issue 并跟踪 NPC 回复。",
+    "通过 /debug 提交原始 ZIP 或 LOG 日志，创建 CNB Issue 并跟踪 NPC 回复。",
     "0.2.0",
     "",
 )
@@ -94,7 +94,7 @@ class CNBReportPlugin(Star):
     @filter.command("debug")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def debug(self, event: AstrMessageEvent, action: str = ""):
-        """提交 ZIP 日志，可附故障描述作为 Issue 标题。"""
+        """提交 ZIP 或 LOG 日志，可附故障描述作为 Issue 标题。"""
         scope = _event_scope(event)
         if not scope:
             return
@@ -165,7 +165,7 @@ class CNBReportPlugin(Star):
             return
         if len(incoming_files) != 1:
             event.stop_event()
-            yield event.plain_result("每个报障任务只接收一个 ZIP 文件，请只发送一个 ZIP。")
+            yield event.plain_result("每个报障任务只接收一个 .zip 或 .log 文件，请只发送一个日志文件。")
             return
         if not self.store.claim_waiting_log(waiting["id"], scope[3]):
             return
@@ -174,16 +174,16 @@ class CNBReportPlugin(Star):
         # attachment processing before yielding; send the receipt directly.
         try:
             await asyncio.wait_for(
-                event.send(event.plain_result("已收到 ZIP，正在准备上传 CNB。")),
+                event.send(event.plain_result("已收到日志文件，正在准备上传 CNB。")),
                 timeout=10,
             )
         except Exception:
-            logger.warning("ZIP 接收回执发送失败，继续处理报障 %s。", waiting["id"], exc_info=True)
+            logger.warning("日志接收回执发送失败，继续处理报障 %s。", waiting["id"], exc_info=True)
         ok, response = await self.jobs.accept_attachment(waiting["id"], incoming_files[0])
         if not ok:
             latest = self.store.get(waiting["id"])
             if latest and latest["status"] == "WAITING_LOG":
-                response += "\n请在等待时限内重新上传 ZIP，或使用 /debug cancel 结束报障。"
+                response += "\n请在等待时限内重新上传 .zip 或 .log 文件，或使用 /debug cancel 结束报障。"
         yield event.plain_result(response)
 
     def _start_report(
@@ -229,8 +229,8 @@ class CNBReportPlugin(Star):
         title_line = f"Issue 标题：{issue_title}\n" if issue_title else ""
         return (
             f"已开始报障。\n{title_line}"
-            f"请在 {max(1, int(self.config.get('log_wait_seconds', 600)) // 60)} 分钟内，在本群用当前账号上传一个 ZIP 日志。\n"
-            "仅提交原始 ZIP，不采集聊天上下文；ZIP 不会解压或脱敏。\n"
+            f"请在 {max(1, int(self.config.get('log_wait_seconds', 600)) // 60)} 分钟内，在本群用当前账号上传一个 .zip 或 .log 日志文件。\n"
+            "仅提交原始文件，不采集聊天上下文；不会读取或脱敏文件内容。\n"
             "使用 /debug status 查询，或 /debug cancel 取消。"
         )
 
