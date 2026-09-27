@@ -4,6 +4,11 @@
     "type": "list",
     "default": []
   },
+  "private_whitelist": {
+    "description": "允许私信报障的 QQ 用户号；留空时不启用私信入口。",
+    "type": "list",
+    "default": []
+  },
   "cnb_api_endpoint": {
     "description": "CNB OpenAPI 服务地址。",
     "type": "string",
@@ -62,17 +67,17 @@
     "default": 20971520
   },
   "file_url_host_allowlist": {
-    "description": "可选的群文件下载域名白名单；留空时仍会拒绝内网、保留地址和非 HTTP(S) 地址。",
+    "description": "可选的群文件或私信文件下载域名白名单；留空时仍会拒绝内网、保留地址和非 HTTP(S) 地址。",
     "type": "list",
     "default": []
   },
   "max_delivery_attempts": {
-    "description": "向原群发送 NPC 分析转发失败时的最大尝试次数。",
+    "description": "向报障来源会话发送 NPC 分析转发失败时的最大尝试次数。",
     "type": "int",
     "default": 10
   },
   "delivery_send_timeout_seconds": {
-    "description": "单次向原群发送 NPC 分析转发的超时时间，超时后按最大尝试次数重试。",
+    "description": "单次向报障来源会话发送 NPC 分析转发的超时时间，超时后按最大尝试次数重试。",
     "type": "int",
     "default": 30
   },

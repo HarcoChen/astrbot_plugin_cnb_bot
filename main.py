@@ -13,7 +13,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
 from .jobs import ReportJobs, STATUS_LABELS
-from .storage import TaskStore
+from .storage import ACTIVE_STATUSES, TaskStore
 
 
 def _component_type(component: Any) -> str:
@@ -28,6 +28,33 @@ def _file_components(event: AstrMessageEvent) -> list[Any]:
     return [component for component in components if _component_type(component) in {"file", "componenttype.file"}]
 
 
+def _mentions_bot(event: AstrMessageEvent, bot_id: str) -> bool:
+    message_obj = getattr(event, "message_obj", None)
+    components = getattr(message_obj, "message", []) or []
+    for component in components:
+        if _component_type(component) not in {"at", "componenttype.at"}:
+            continue
+        target = getattr(component, "qq", None)
+        if target is None:
+            target = getattr(component, "target", None)
+        if str(target or "") == str(bot_id):
+            return True
+    return False
+
+
+def _plain_message_text(event: AstrMessageEvent) -> str:
+    message_obj = getattr(event, "message_obj", None)
+    components = getattr(message_obj, "message", []) or []
+    text = "".join(
+        str(getattr(component, "text", "") or "")
+        for component in components
+        if _component_type(component) in {"plain", "componenttype.plain"}
+    ).strip()
+    if components:
+        return text
+    return str(getattr(event, "message_str", "") or "").strip()
+
+
 def _as_string_list(value: Any) -> list[str]:
     if isinstance(value, str):
         return [item.strip() for item in value.split(",") if item.strip()]
@@ -36,14 +63,27 @@ def _as_string_list(value: Any) -> list[str]:
     return []
 
 
+def _is_private_message(event: AstrMessageEvent) -> bool:
+    checker = getattr(event, "is_private_chat", None)
+    if callable(checker):
+        try:
+            return bool(checker())
+        except Exception:
+            pass
+    return not str(event.get_group_id() or "")
+
+
 def _event_scope(event: AstrMessageEvent) -> tuple[str, str, str, str] | None:
+    private = _is_private_message(event)
     scope = (
         str(event.get_platform_name() or ""),
         str(event.get_self_id() or ""),
-        str(event.get_group_id() or ""),
+        "" if private else str(event.get_group_id() or ""),
         str(event.get_sender_id() or ""),
     )
-    return scope if all(scope) and event.unified_msg_origin else None
+    if not (scope[0] and scope[1] and scope[3] and event.unified_msg_origin):
+        return None
+    return scope if scope[2] or private else None
 
 
 def _debug_argument(event: AstrMessageEvent, parsed_action: str) -> str:
@@ -60,7 +100,7 @@ def _debug_argument(event: AstrMessageEvent, parsed_action: str) -> str:
 @register(
     "astrbot_plugin_cnb_bot",
     "harco",
-    "通过 /debug 提交原始 ZIP 或 LOG 日志，创建 CNB Issue 并跟踪 NPC 回复。",
+    "通过群聊或私信 /debug 提交原始 ZIP 或 LOG 日志，创建 CNB Issue 并跟踪 NPC 回复。",
     "0.2.0",
     "",
 )
@@ -92,19 +132,32 @@ class CNBReportPlugin(Star):
         self.store.close()
 
     @filter.command("debug")
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def debug(self, event: AstrMessageEvent, action: str = ""):
         """提交 ZIP 或 LOG 日志，可附故障描述作为 Issue 标题。"""
         scope = _event_scope(event)
         if not scope:
             return
         event.stop_event()
-        if scope[2] not in set(_as_string_list(self.config.get("group_whitelist", []))):
+        private = _is_private_message(event)
+        if private:
+            if scope[3] not in set(_as_string_list(self.config.get("private_whitelist", []))):
+                yield event.plain_result("未启用私信报障，请联系管理员将你的 QQ 号加入私信白名单。")
+                return
+        elif scope[2] not in set(_as_string_list(self.config.get("group_whitelist", []))):
             yield event.plain_result("此群未启用报障功能，请联系管理员配置群白名单。")
             return
         argument = _debug_argument(event, action)
         if not argument:
             response = self._start_report(scope, str(event.unified_msg_origin))
+        elif argument.lower() == "analyze":
+            task = self.store.find_current(*scope)
+            if task:
+                platform_name, bot_id, group_id, sender_id = scope
+                _, response = await self.jobs.request_npc_analysis(
+                    task["id"], sender_id, platform_name, bot_id, group_id
+                )
+            else:
+                response = "当前没有可重新分析的报障。"
         elif argument.lower() in {"status", "状态"}:
             task = self.store.find_current(*scope)
             if task:
@@ -115,7 +168,7 @@ class CNBReportPlugin(Star):
                 else:
                     response = "已刷新完整报障状态。\n" + self._format_status(task)
             else:
-                response = "你在此群还没有报障，请发送 /debug 开始。"
+                response = "你在此会话还没有报障，请发送 /debug 开始。"
         elif argument.lower() in {"resolve", "resolved", "恢复", "已恢复"}:
             task = self.store.find_current(*scope)
             if task:
@@ -133,14 +186,14 @@ class CNBReportPlugin(Star):
                     # _finish already sent the completion notice with a mention.
                     response = ""
             else:
-                response = "你在此群还没有报障。"
+                response = "你在此会话还没有报障。"
         elif argument.lower() in {"cancel", "取消"}:
             task = self.store.find_current(*scope)
             if task:
                 platform_name, bot_id, group_id, sender_id = scope
                 _, response = self.jobs.cancel(task["id"], sender_id, platform_name, bot_id, group_id)
             else:
-                response = "你在此群还没有报障。"
+                response = "你在此会话还没有报障。"
         else:
             title = " ".join(argument.split())
             response = self._start_report(
@@ -153,38 +206,89 @@ class CNBReportPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_group_message(self, event: AstrMessageEvent):
+        scope = _event_scope(event)
+        if (
+            not scope
+            or _is_private_message(event)
+            or scope[2] not in set(_as_string_list(self.config.get("group_whitelist", [])))
+        ):
+            return
+        response = await self._handle_report_message(event, scope, private=False)
+        if response:
+            yield event.plain_result(response)
+
+    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
+    async def on_private_message(self, event: AstrMessageEvent):
+        scope = _event_scope(event)
+        if (
+            not scope
+            or not _is_private_message(event)
+            or scope[3] not in set(_as_string_list(self.config.get("private_whitelist", [])))
+        ):
+            return
+        response = await self._handle_report_message(event, scope, private=True)
+        if response:
+            yield event.plain_result(response)
+
+    async def _handle_report_message(
+        self,
+        event: AstrMessageEvent,
+        scope: tuple[str, str, str, str],
+        *,
+        private: bool,
+    ) -> str | None:
         # Ordinary messages are neither cached nor included in CNB Issues.
         incoming_files = _file_components(event)
-        if not incoming_files:
-            return
-        scope = _event_scope(event)
-        if not scope or scope[2] not in set(_as_string_list(self.config.get("group_whitelist", []))):
-            return
-        waiting = self.store.find_waiting(*scope)
-        if not waiting:
-            return
-        if len(incoming_files) != 1:
+        if incoming_files:
+            waiting = self.store.find_waiting(*scope)
+            if not waiting:
+                return
+            if len(incoming_files) != 1:
+                event.stop_event()
+                return "每个报障任务只接收一个 .zip 或 .log 文件，请只发送一个日志文件。"
+            if not self.store.claim_waiting_log(waiting["id"], scope[3]):
+                return
             event.stop_event()
-            yield event.plain_result("每个报障任务只接收一个 .zip 或 .log 文件，请只发送一个日志文件。")
+            # The pipeline can close a stopped event at its first yield. Finish the
+            # attachment processing before yielding; send the receipt directly.
+            try:
+                await asyncio.wait_for(
+                    event.send(event.plain_result("已收到日志文件，正在准备上传 CNB。")),
+                    timeout=10,
+                )
+            except Exception:
+                logger.warning("日志接收回执发送失败，继续处理报障 %s。", waiting["id"], exc_info=True)
+            ok, response = await self.jobs.accept_attachment(waiting["id"], incoming_files[0])
+            if not ok:
+                latest = self.store.get(waiting["id"])
+                if latest and latest["status"] == "WAITING_LOG":
+                    response += "\n请在等待时限内重新上传 .zip 或 .log 文件，或使用 /debug cancel 结束报障。"
+            return response
+
+        if not private and not _mentions_bot(event, scope[1]):
             return
-        if not self.store.claim_waiting_log(waiting["id"], scope[3]):
+        text = _plain_message_text(event)
+        if text.lstrip().lower().startswith(("/debug", "!debug")):
+            return
+        task = self.store.find_current(*scope)
+        if not task or task.get("status") not in ACTIVE_STATUSES:
+            return
+        if private and not text:
             return
         event.stop_event()
-        # The pipeline can close a stopped event at its first yield. Finish the
-        # attachment processing before yielding; send the receipt directly.
-        try:
-            await asyncio.wait_for(
-                event.send(event.plain_result("已收到日志文件，正在准备上传 CNB。")),
-                timeout=10,
+        if not private and not text:
+            response = "请在 @机器人 后附上要写入 CNB Issue 评论的补充文字。"
+        elif not task.get("issue_number"):
+            response = (
+                "当前 Issue 尚未创建；创建后再私信发送补充说明。"
+                if private
+                else "当前 Issue 尚未创建；创建后再 @机器人发送补充说明。"
             )
-        except Exception:
-            logger.warning("日志接收回执发送失败，继续处理报障 %s。", waiting["id"], exc_info=True)
-        ok, response = await self.jobs.accept_attachment(waiting["id"], incoming_files[0])
-        if not ok:
-            latest = self.store.get(waiting["id"])
-            if latest and latest["status"] == "WAITING_LOG":
-                response += "\n请在等待时限内重新上传 .zip 或 .log 文件，或使用 /debug cancel 结束报障。"
-        yield event.plain_result(response)
+        elif task.get("status") == "CLOSING_ISSUE":
+            response = "此报障正在关闭 Issue，暂时不能追加评论。"
+        else:
+            ok, response = await self.jobs.append_issue_comment(task["id"], text)
+        return response
 
     def _start_report(
         self,
@@ -225,11 +329,19 @@ class CNBReportPlugin(Star):
         created, existing = self.store.create_waiting(task)
         if not created and existing:
             label = STATUS_LABELS.get(existing["status"], existing["status"])
-            return f"你在此群已有未结束的报障（{label}）。\n使用 /debug status 查询，或 /debug cancel 取消。"
+            return f"你在此会话已有未结束的报障（{label}）。\n使用 /debug status 查询，或 /debug cancel 取消。"
         title_line = f"Issue 标题：{issue_title}\n" if issue_title else ""
+        private = not group_id
+        place = "本私信会话" if private else "本群"
+        supplement_hint = (
+            "Issue 创建后，可直接私信发送补充信息，文字会成为 Issue 评论。\n"
+            if private
+            else "Issue 创建后，可 @机器人把补充信息发送为 Issue 评论。\n"
+        )
         return (
             f"已开始报障。\n{title_line}"
-            f"请在 {max(1, int(self.config.get('log_wait_seconds', 600)) // 60)} 分钟内，在本群用当前账号上传一个 .zip 或 .log 日志文件。\n"
+            f"请在 {max(1, int(self.config.get('log_wait_seconds', 600)) // 60)} 分钟内，在{place}用当前账号上传一个 .zip 或 .log 日志文件。\n"
+            f"{supplement_hint}"
             "仅提交原始文件，不采集聊天上下文；不会读取或脱敏文件内容。\n"
             "使用 /debug status 查询，或 /debug cancel 取消。"
         )
@@ -246,7 +358,9 @@ class CNBReportPlugin(Star):
         if task.get("last_error"):
             lines.append(f"说明：{task['last_error']}")
         if task.get("status") == "AWAITING_RECOVERY":
-            lines.append("确认按建议处理后发送 /debug resolve，插件会关闭此 Issue。")
+            if task.get("analysis_summary"):
+                lines.append(f"结论：{task['analysis_summary']}")
+            lines.append("处理并确认恢复后发送 /debug resolve。")
         if task.get("status") in {"AWAITING_RECOVERY", "CLOSING_ISSUE"} and task.get("last_issue_error"):
             lines.append(f"Issue 状态同步遇到问题，插件会自动重试：{task['last_issue_error']}")
         if task.get("status") == "DELIVERING" and task.get("last_delivery_error"):
