@@ -608,7 +608,7 @@ class ReportJobs:
                     return
                 summary = current.get("attachment_summary", {})
                 body = self._issue_body(current, asset, summary)
-                title = "[Debug] ZIP 日志分析"
+                title = str(current.get("issue_title") or "[Debug] ZIP 日志分析")
                 self.store.update(
                     task_id,
                     fields={"external_phase": "issue_create"},

@@ -15,13 +15,6 @@ from astrbot.api.star import Context, Star, StarTools, register
 from .jobs import ReportJobs, STATUS_LABELS
 from .storage import TaskStore
 
-_HELP = (
-    "/debug：提交 ZIP 日志\n"
-    "/debug status：刷新并查看完整报障状态\n"
-    "/debug resolve：确认恢复并关闭 CNB Issue\n"
-    "/debug cancel：取消自己的报障"
-)
-
 
 def _component_type(component: Any) -> str:
     value = getattr(component, "type", "")
@@ -51,6 +44,17 @@ def _event_scope(event: AstrMessageEvent) -> tuple[str, str, str, str] | None:
         str(event.get_sender_id() or ""),
     )
     return scope if all(scope) and event.unified_msg_origin else None
+
+
+def _debug_argument(event: AstrMessageEvent, parsed_action: str) -> str:
+    """Return all text after /debug, preserving multi-word issue titles."""
+    raw = str(getattr(event, "message_str", "") or "").strip()
+    parts = raw.split(maxsplit=1)
+    if len(parts) == 2:
+        command_head = parts[0].lstrip("/!#$%^&*+=:;~.,<>").lower()
+        if command_head == "debug":
+            return parts[1].strip()
+    return str(parsed_action or "").strip()
 
 
 @register(
@@ -90,7 +94,7 @@ class CNBReportPlugin(Star):
     @filter.command("debug")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def debug(self, event: AstrMessageEvent, action: str = ""):
-        """提交 ZIP 日志；status 刷新，resolve 确认恢复，cancel 取消。"""
+        """提交 ZIP 日志，可附故障描述作为 Issue 标题。"""
         scope = _event_scope(event)
         if not scope:
             return
@@ -98,10 +102,10 @@ class CNBReportPlugin(Star):
         if scope[2] not in set(_as_string_list(self.config.get("group_whitelist", []))):
             yield event.plain_result("此群未启用报障功能，请联系管理员配置群白名单。")
             return
-        action = action.strip().lower()
-        if not action:
+        argument = _debug_argument(event, action)
+        if not argument:
             response = self._start_report(scope, str(event.unified_msg_origin))
-        elif action in {"status", "状态"}:
+        elif argument.lower() in {"status", "状态"}:
             task = self.store.find_current(*scope)
             if task:
                 task = await self.jobs.refresh_task(task["id"], notify=False) or task
@@ -112,7 +116,7 @@ class CNBReportPlugin(Star):
                     response = "已刷新完整报障状态。\n" + self._format_status(task)
             else:
                 response = "你在此群还没有报障，请发送 /debug 开始。"
-        elif action in {"resolve", "resolved", "恢复", "已恢复"}:
+        elif argument.lower() in {"resolve", "resolved", "恢复", "已恢复"}:
             task = self.store.find_current(*scope)
             if task:
                 previous_status = str(task.get("status", ""))
@@ -130,7 +134,7 @@ class CNBReportPlugin(Star):
                     response = ""
             else:
                 response = "你在此群还没有报障。"
-        elif action in {"cancel", "取消"}:
+        elif argument.lower() in {"cancel", "取消"}:
             task = self.store.find_current(*scope)
             if task:
                 platform_name, bot_id, group_id, sender_id = scope
@@ -138,7 +142,12 @@ class CNBReportPlugin(Star):
             else:
                 response = "你在此群还没有报障。"
         else:
-            response = _HELP
+            title = " ".join(argument.split())
+            response = self._start_report(
+                scope,
+                str(event.unified_msg_origin),
+                issue_title=title,
+            )
         if response:
             yield event.plain_result(response)
 
@@ -177,7 +186,12 @@ class CNBReportPlugin(Star):
                 response += "\n请在等待时限内重新上传 ZIP，或使用 /debug cancel 结束报障。"
         yield event.plain_result(response)
 
-    def _start_report(self, scope: tuple[str, str, str, str], unified_msg_origin: str) -> str:
+    def _start_report(
+        self,
+        scope: tuple[str, str, str, str],
+        unified_msg_origin: str,
+        issue_title: str = "",
+    ) -> str:
         missing = []
         if not self.config.get("cnb_repository"):
             missing.append("目标 CNB 仓库")
@@ -206,13 +220,15 @@ class CNBReportPlugin(Star):
             "unified_msg_origin": unified_msg_origin,
             "deadline": time.time() + int(self.config.get("log_wait_seconds", 600)),
             "repository": str(self.config.get("cnb_repository", "")).strip().strip("/"),
+            "issue_title": issue_title,
         }
         created, existing = self.store.create_waiting(task)
         if not created and existing:
             label = STATUS_LABELS.get(existing["status"], existing["status"])
             return f"你在此群已有未结束的报障（{label}）。\n使用 /debug status 查询，或 /debug cancel 取消。"
+        title_line = f"Issue 标题：{issue_title}\n" if issue_title else ""
         return (
-            "已开始报障。\n"
+            f"已开始报障。\n{title_line}"
             f"请在 {max(1, int(self.config.get('log_wait_seconds', 600)) // 60)} 分钟内，在本群用当前账号上传一个 ZIP 日志。\n"
             "仅提交原始 ZIP，不采集聊天上下文；ZIP 不会解压或脱敏。\n"
             "使用 /debug status 查询，或 /debug cancel 取消。"
