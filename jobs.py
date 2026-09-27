@@ -330,7 +330,9 @@ class ReportJobs:
                 if phase in {"prepared", "asset_upload", "asset_uploaded"}:
                     # The create routine serializes with attachment processing and
                     # safely resumes upload phases. It never repeats issue_create.
-                    await self._create_issue_from_prepared(task_id)
+                    await self._create_issue_from_prepared(
+                        task_id, notify_issue_created=False
+                    )
                 else:
                     await self._mark_issue_creation_uncertain(task)
             elif status == "TRIGGERING_NPC":
@@ -540,17 +542,19 @@ class ReportJobs:
             finally:
                 archive_path.unlink(missing_ok=True)
 
-        await self._create_issue_from_prepared(task_id)
+        await self._create_issue_from_prepared(task_id, notify_issue_created=False)
         updated = self.store.get(task_id)
         if updated and updated["status"] == "WAITING_NPC":
-            return True, f"原始 ZIP 已上传，Issue 已创建：{updated.get('issue_url', '')}"
+            return True, f"日志已上传，NPC 正在分析：{updated.get('issue_url', '')}"
         if updated and updated["status"] == "UNCERTAIN":
             return False, updated.get("last_error", "CNB 请求结果需要核对。")
         if updated and updated["status"] == "FAILED":
             return False, updated.get("last_error", "CNB 流程失败。")
         return True, "日志已处理。"
 
-    async def _create_issue_from_prepared(self, task_id: str) -> None:
+    async def _create_issue_from_prepared(
+        self, task_id: str, notify_issue_created: bool = True
+    ) -> None:
         lock = self._task_locks.setdefault(task_id, asyncio.Lock())
         async with lock:
             task = self.store.get(task_id)
@@ -645,10 +649,11 @@ class ReportJobs:
                         )
                     return
                 Path(prepared_path).unlink(missing_ok=True)
-                await self._notify(
-                    current,
-                    f"报障 {task_id} 已创建 CNB Issue：{issue_url}\n日志已上传并开始请求 NPC 分析。",
-                )
+                if notify_issue_created:
+                    await self._notify(
+                        current,
+                        f"报障 {task_id} 已创建 CNB Issue：{issue_url}\n日志已上传并开始请求 NPC 分析。",
+                    )
                 current = self.store.get(task_id) or current
                 if current["status"] != "TRIGGERING_NPC":
                     return
