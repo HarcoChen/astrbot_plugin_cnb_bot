@@ -17,7 +17,7 @@
 </p>
 
 > [!TIP]
-> Koishi版本见(CNB-Bot-Koishi)[https://github.com/HarcoChen/cnb-bot-koishi]
+> Koishi版本见[CNB-Bot-Koishi](https://github.com/HarcoChen/cnb-bot-koishi)
 
 一次完整的报障大概是这样：
 
