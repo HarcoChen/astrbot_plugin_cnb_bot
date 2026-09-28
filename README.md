@@ -2,6 +2,23 @@
 
 一个 AstrBot 插件。用户在 QQ 群或私信里发 `/debug`、传一份日志，插件会在 CNB 仓库开一个 Issue，让仓库的 NPC（比如 CodeBuddy）分析，再把结论发回聊天里。
 
+<p align="center">
+  <a href="https://github.com/AstrBotDevs/AstrBot">
+    <img src="https://img.shields.io/badge/AstrBot-Plugin-635BFF" alt="AstrBot Plugin">
+  </a>
+  </a>
+  <a href="https://github.com/HarcoChen/astrbot_plugin_cnb_bot/commits">
+    <img src="https://img.shields.io/github/last-commit/HarcoChen/astrbot_plugin_cnb_bot" alt="Last Commit">
+  </a>
+  <a href="https://github.com/HarcoChen/astrbot_plugin_cnb_bot">
+    <img src="https://img.shields.io/github/license/HarcoChen/astrbot_plugin_cnb_bot" alt="License">
+  </a>
+  </a>
+</p>
+
+> [!TIP]
+> Koishi版本见(CNB-Bot-Koishi)[https://github.com/HarcoChen/cnb-bot-koishi]
+
 一次完整的报障大概是这样：
 
 ```text
