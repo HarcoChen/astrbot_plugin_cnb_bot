@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from astrbot.api import logger as log
+from astrbot.api import logger
 
 from .cnb_client import CNBAPIError, CNBClient, CNBNetworkError
 from .qq_files import FileInputError, stage_log_file
@@ -178,7 +178,7 @@ class ReportJobs:
         if self._runner is None or self._runner.done():
             self._stopping.clear()
             self._runner = asyncio.create_task(self._run(), name="cnb-report-jobs")
-            log.info("CNB 报障插件后台任务已启动，NPC 轮询间隔 %s 秒。", self._poll_interval())
+            logger.info("CNB 报障插件后台任务已启动，NPC 轮询间隔 %s 秒。", self._poll_interval())
 
     async def shutdown(self) -> None:
         self._stopping.set()
@@ -205,7 +205,7 @@ class ReportJobs:
             elif status == "WAITING_NPC":
                 # A reload may happen just after an NPC reply was posted. Do not
                 # make the user wait out the persisted exponential backoff.
-                log.info("恢复报障 %s 的 NPC 轮询，启动后立即查询 CNB 评论。", task["id"])
+                logger.info("恢复报障 %s 的 NPC 轮询，启动后立即查询 CNB 评论。", task["id"])
                 self.store.update(
                     task["id"],
                     fields={
@@ -300,7 +300,7 @@ class ReportJobs:
         except Exception:
             # A recovery error must not permanently kill the worker. In particular,
             # DELIVERING tasks are still eligible for retry in the regular tick.
-            log.exception("CNB 报障任务启动恢复失败；继续后台轮询。")
+            logger.exception("CNB 报障任务启动恢复失败；继续后台轮询。")
         while not self._stopping.is_set():
             try:
                 await self._tick()
@@ -308,7 +308,7 @@ class ReportJobs:
                 raise
             except Exception:
                 # Keep the worker alive if one tick fails outside its per-task guard.
-                log.exception("CNB 报障任务后台轮询异常；将在下一轮重试。")
+                logger.exception("CNB 报障任务后台轮询异常；将在下一轮重试。")
             try:
                 await asyncio.wait_for(self._stopping.wait(), timeout=3)
             except asyncio.TimeoutError:
@@ -348,7 +348,7 @@ class ReportJobs:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("处理报障任务 %s 时发生异常", task.get("id"))
+                logger.exception("处理报障任务 %s 时发生异常", task.get("id"))
 
     async def refresh_task(self, task_id: str, *, notify: bool = True) -> dict[str, Any] | None:
         # Suppress only this refresh's notices, never another concurrent task's.
@@ -428,7 +428,7 @@ class ReportJobs:
                 # not advanced yet (or a retry was scheduled).
                 return latest
 
-        log.warning("报障 %s 的状态刷新达到单次推进上限。", task_id)
+        logger.warning("报障 %s 的状态刷新达到单次推进上限。", task_id)
         return self.store.get(task_id)
 
     async def _refresh_preparing_log(self, task_id: str) -> None:
@@ -522,7 +522,7 @@ class ReportJobs:
             self._cleanup_temp_files(task_id)
             self._cleanup_prepared_candidates(task_id)
             try:
-                log.info("报障 %s 开始暂存原始日志文件。", task_id)
+                logger.info("报障 %s 开始暂存原始日志文件。", task_id)
                 staged_path, source_name, file_bytes = await asyncio.to_thread(
                     stage_log_file,
                     component,
@@ -532,7 +532,7 @@ class ReportJobs:
                 )
                 source_suffix = Path(source_name).suffix.lower()
                 prepared_path = self.prepared_dir / f"{task_id}{source_suffix}"
-                log.info("报障 %s 原始日志文件已暂存（%s 字节），准备上传 CNB。", task_id, file_bytes)
+                logger.info("报障 %s 原始日志文件已暂存（%s 字节），准备上传 CNB。", task_id, file_bytes)
                 current = self.store.get(task_id)
                 if not current or current["status"] != "PREPARING_LOG":
                     prepared_path.unlink(missing_ok=True)
@@ -574,7 +574,7 @@ class ReportJobs:
                     )
                 return False, str(exc)
             except Exception as exc:
-                log.exception("准备原始日志附件失败，报障编号 %s", task_id)
+                logger.exception("准备原始日志附件失败，报障编号 %s", task_id)
                 self._cleanup_temp_files(task_id)
                 if prepared_path:
                     prepared_path.unlink(missing_ok=True)
@@ -626,10 +626,10 @@ class ReportJobs:
                 client = self._client(str(task.get("repository", "")))
                 await asyncio.to_thread(client.create_comment, issue_number, comment)
             except CNBNetworkError:
-                log.warning("报障 %s 的补充评论请求结果不确定。", task_id)
+                logger.warning("报障 %s 的补充评论请求结果不确定。", task_id)
                 return False, self._comment_uncertain_notice(task)
             except CNBAPIError as exc:
-                log.warning(
+                logger.warning(
                     "报障 %s 的补充评论请求返回 HTTP %s。",
                     task_id,
                     exc.status_code,
@@ -638,10 +638,10 @@ class ReportJobs:
                     return False, self._comment_uncertain_notice(task)
                 return False, f"补充信息提交失败：{exc}"
             except Exception:
-                log.exception("发送报障 %s 的补充 Issue 评论失败。", task_id)
+                logger.exception("发送报障 %s 的补充 Issue 评论失败。", task_id)
                 return False, "补充信息提交失败，请稍后再发一次；如持续失败请联系管理员。"
 
-        log.info("报障 %s 已追加一条用户补充评论。", task_id)
+        logger.info("报障 %s 已追加一条用户补充评论。", task_id)
         if task.get("status") in {"WAITING_NPC", "AWAITING_RECOVERY"}:
             return True, (
                 "已补充到 Issue。\n"
@@ -768,7 +768,7 @@ class ReportJobs:
                     },
                     expected_statuses={"TRIGGERING_NPC"},
                 )
-                log.warning("报障 %s 的 NPC 重新分析请求结果不确定。", task_id)
+                logger.warning("报障 %s 的 NPC 重新分析请求结果不确定。", task_id)
                 return False, self._trigger_uncertain_notice(task)
             except Exception as exc:
                 self.store.update(
@@ -782,7 +782,7 @@ class ReportJobs:
                     },
                     expected_statuses={"TRIGGERING_NPC"},
                 )
-                log.exception("报障 %s 提交 NPC 重新分析请求时发生异常。", task_id)
+                logger.exception("报障 %s 提交 NPC 重新分析请求时发生异常。", task_id)
                 return False, self._trigger_uncertain_notice(task)
 
             comment_id = str(comment.get("id", "")) if isinstance(comment, dict) else ""
@@ -801,7 +801,7 @@ class ReportJobs:
             )
             if not updated or updated.get("status") != "WAITING_NPC":
                 return False, "请求已发出，但报障状态刚刚变化，请发送 /debug status 查看。"
-            log.info(
+            logger.info(
                 "报障 %s 已提交第 %s 次 NPC 分析请求，将每 %s 秒查询一次 CNB 评论。",
                 task_id,
                 analysis_round,
@@ -828,7 +828,7 @@ class ReportJobs:
                 client = self._client(str(task.get("repository", "")))
                 asset = task.get("uploaded_asset")
                 if not asset:
-                    log.info("报障 %s 开始将原始日志文件上传到 CNB。", task_id)
+                    logger.info("报障 %s 开始将原始日志文件上传到 CNB。", task_id)
                     self.store.update(
                         task_id,
                         fields={"external_phase": "asset_upload"},
@@ -839,7 +839,7 @@ class ReportJobs:
                         prepared_path,
                         str(task.get("source_filename", "")),
                     )
-                    log.info("报障 %s 原始日志文件已上传到 CNB。", task_id)
+                    logger.info("报障 %s 原始日志文件已上传到 CNB。", task_id)
                     self.store.update(
                         task_id,
                         fields={"external_phase": "asset_uploaded", "uploaded_asset": asset},
@@ -983,7 +983,7 @@ class ReportJobs:
                     expected_statuses={"TRIGGERING_NPC"},
                 )
                 if transitioned and transitioned["status"] == "WAITING_NPC":
-                    log.info(
+                    logger.info(
                         "报障 %s 已进入 NPC 等待阶段，将每 %s 秒查询一次 CNB 评论。",
                         task_id,
                         self._poll_interval(),
@@ -1052,7 +1052,7 @@ class ReportJobs:
                         f"\n原因：{exc}",
                     )
             except Exception as exc:
-                log.exception("创建 CNB Issue 流程失败，报障编号 %s", task_id)
+                logger.exception("创建 CNB Issue 流程失败，报障编号 %s", task_id)
                 current = self.store.get(task_id) or task
                 phase = current.get("external_phase")
                 if phase == "issue_create":
@@ -1188,7 +1188,7 @@ class ReportJobs:
             await self._schedule_poll(task, exc)
             return
         except Exception as exc:
-            log.exception("报障 %s 核对 NPC 触发评论时发生异常。", task["id"])
+            logger.exception("报障 %s 核对 NPC 触发评论时发生异常。", task["id"])
             await self._schedule_poll(task, exc)
             return
         trigger_body = str(task.get("trigger_body", ""))
@@ -1236,20 +1236,20 @@ class ReportJobs:
             try:
                 await self._poll_npc_locked(current)
             except Exception as exc:
-                log.exception("处理报障 %s 的 NPC 回复时发生异常。", current["id"])
+                logger.exception("处理报障 %s 的 NPC 回复时发生异常。", current["id"])
                 latest = self.store.get(str(current["id"]))
                 if latest and latest.get("status") == "WAITING_NPC":
                     await self._schedule_poll(latest, exc)
 
     async def _poll_npc_locked(self, task: dict[str, Any]) -> None:
-        log.info("报障 %s 开始查询 NPC 评论。", task["id"])
+        logger.info("报障 %s 开始查询 NPC 评论。", task["id"])
         try:
             comments = await self._all_issue_comments(task)
         except (CNBAPIError, CNBNetworkError) as exc:
             await self._schedule_poll(task, exc)
             return
         except Exception as exc:
-            log.exception("报障 %s 查询 NPC 评论时发生异常。", task["id"])
+            logger.exception("报障 %s 查询 NPC 评论时发生异常。", task["id"])
             await self._schedule_poll(task, exc)
             return
 
@@ -1278,7 +1278,7 @@ class ReportJobs:
             newer_count += 1
             matches.append((created_at, comment))
         if not matches:
-            log.info(
+            logger.info(
                 "报障 %s NPC 轮询完成：读取 %s 条评论，编号标记匹配 %s 条，可信作者匹配 %s 条，触发时间之后 %s 条。",
                 task["id"],
                 len(comments),
@@ -1290,7 +1290,7 @@ class ReportJobs:
             return
 
         _, final_comment = min(matches, key=lambda item: item[0])
-        log.info(
+        logger.info(
             "报障 %s 找到 NPC 最终回复（评论 ID：%s），开始转发。",
             task["id"],
             final_comment.get("id", ""),
@@ -1374,7 +1374,7 @@ class ReportJobs:
             "last_poll_error": str(error) if error else "",
         }
         if error:
-            log.warning(
+            logger.warning(
                 "报障 %s CNB 评论轮询失败（%s），将在 %s 秒后重试。",
                 task["id"],
                 type(error).__name__,
@@ -1424,7 +1424,7 @@ class ReportJobs:
                 )
                 return
             delay = min(5 * (2 ** min(attempts - 1, 5)), 120)
-            log.warning(
+            logger.warning(
                 "报障 %s NPC 转发失败（%s）；第 %s/%s 次失败，将在 %s 秒后重试。",
                 task["id"],
                 error_message,
@@ -1454,7 +1454,7 @@ class ReportJobs:
             },
             expected_statuses={"DELIVERING"},
         )
-        log.info("报障 %s NPC 分析转发成功（%s/%s）。", task["id"], index + 1, len(parts))
+        logger.info("报障 %s NPC 分析转发成功（%s/%s）。", task["id"], index + 1, len(parts))
         if (
             updated
             and updated["status"] == "DELIVERING"
@@ -1547,7 +1547,7 @@ class ReportJobs:
                         expected_statuses={"AWAITING_RECOVERY"},
                     )
                 except Exception as exc:
-                    log.warning("报障 %s 检查 CNB Issue 状态失败：%s", task_id, exc)
+                    logger.warning("报障 %s 检查 CNB Issue 状态失败：%s", task_id, exc)
                     self.store.update(
                         task_id,
                         fields={
@@ -1596,7 +1596,7 @@ class ReportJobs:
             except Exception as exc:
                 attempts = int(task.get("issue_close_attempts", 0)) + 1
                 delay = min(5 * (2 ** min(attempts - 1, 6)), 300)
-                log.warning(
+                logger.warning(
                     "报障 %s %s，但关闭 CNB Issue 失败；%s 秒后重试：%s",
                     task_id,
                     "自动结束超时" if close_reason == "timeout" else "已确认恢复",
@@ -1701,7 +1701,7 @@ class ReportJobs:
                 timeout=self._delivery_send_timeout(),
             )
         except Exception:
-            log.exception("向原会话发送报障状态失败：%s", task.get("id"))
+            logger.exception("向原会话发送报障状态失败：%s", task.get("id"))
 
     async def _send_to_session(self, task: dict[str, Any], text: str, mention: bool) -> None:
         from astrbot.api.event import MessageChain
@@ -1921,7 +1921,7 @@ class ReportJobs:
         try:
             await asyncio.to_thread(client.create_comment, issue_number, body)
         except Exception as exc:
-            log.warning("报障 %s 发布超时关闭说明失败，继续关闭 Issue：%s", task["id"], exc)
+            logger.warning("报障 %s 发布超时关闭说明失败，继续关闭 Issue：%s", task["id"], exc)
 
     def cancel(self, task_id: str, user_id: str, platform_name: str, bot_id: str, group_id: str) -> tuple[bool, str]:
         task = self.store.get(task_id)

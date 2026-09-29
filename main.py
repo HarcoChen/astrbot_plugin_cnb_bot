@@ -147,9 +147,10 @@ class CNBReportPlugin(Star):
         self.config = dict(config or {})
         try:
             data_dir = Path(StarTools.get_data_dir("astrbot_plugin_cnb_bot"))
-        except Exception:
-            data_dir = Path(__file__).resolve().parent / "data"
-            logger.warning("无法定位 AstrBot 插件数据目录，回退到插件目录 data。")
+        except Exception as exc:
+            raise RuntimeError(
+                "无法获取 AstrBot 插件数据目录，拒绝在插件目录中创建数据文件。"
+            ) from exc
         data_dir.mkdir(parents=True, exist_ok=True)
         self.store = TaskStore(data_dir / "reports.sqlite3")
         self.jobs = ReportJobs(context, self.config, self.store, data_dir)

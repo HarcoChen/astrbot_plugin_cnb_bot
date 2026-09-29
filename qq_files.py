@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ipaddress
-import logging
 import os
 import shutil
 import socket
@@ -14,9 +13,9 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from .settings import format_bytes
+from astrbot.api import logger
 
-log = logging.getLogger("astrbot_plugin_cnb_bot")
+from .settings import format_bytes
 
 
 class FileInputError(ValueError):
@@ -153,7 +152,7 @@ def stage_log_file(
     url = str(getattr(component, "url", "") or "")
     source_path = _component_local_path(component)
     if source_path and source_path.exists():
-        log.info("报障日志文件使用 AstrBot 提供的本地文件副本。")
+        logger.info("报障日志文件使用 AstrBot 提供的本地文件副本。")
         try:
             info = source_path.lstat()
         except OSError as exc:
@@ -171,7 +170,7 @@ def stage_log_file(
         # AstrBot adapters often expose both a local file_ and a remote url.
         # Reuse the downloaded local copy when available so QQ/CDN URL fetches
         # cannot stall an otherwise ready upload.
-        log.info("报障日志文件没有可用的本地副本，正在下载适配器提供的文件 URL。")
+        logger.info("报障日志文件没有可用的本地副本，正在下载适配器提供的文件 URL。")
         byte_count = _download_limited(url, destination, max_bytes, allowed_hosts)
     elif source_path:
         raise FileInputError("日志文件已失效，请重新上传。")
