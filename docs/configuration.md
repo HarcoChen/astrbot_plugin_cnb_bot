@@ -25,9 +25,19 @@
 
 | 配置 | 默认值 | 说明 |
 | --- | --- | --- |
-| `group_whitelist` | 空 | 允许报障的 QQ 群号。空表示所有群都不启用 |
+| `group_whitelist` | 空 | 允许报障的群 ID。OneBot 填 QQ 群号；QQ 官方机器人填群 OpenID。空表示所有群都不启用 |
 | `private_whitelist` | 空 | 私信白名单。空表示所有人都能私信报障，填了就只允许名单里的用户 |
 | `reply_in_disabled_groups` | 关 | 未启用的群里有人发 `/debug` 时是否回复提示。关闭时插件完全不响应，方便和其他插件的 `/debug` 指令共存 |
+
+## QQ 指令面板
+
+| 配置 | 默认值 | 说明 |
+| --- | --- | --- |
+| `qq_command_panel_enabled` | 关 | 开启后，插件启动时自动创建或更新单聊和群聊的全局指令面板 |
+| `qq_command_panel_app_id` | 空 | QQ 开放平台机器人的 AppID |
+| `qq_command_panel_client_secret` | 空 | 同一机器人的密钥；在 AstrBot 插件配置中以密钥字段保存 |
+
+面板包含 `/debug`、`/debug status`、`/debug analyze`、`/debug resolve`、`/debug cancel` 和 `/debug help`。面板同步仅调用 QQ 开放平台 API；未启用时不会请求该 API。OneBot/aiocqhttp 无需配置面板凭据，继续使用聊天指令。官方机器人群面板对所有群可见，实际能否报障仍由 `group_whitelist` 控制。
 
 ## 用户看到的文字
 

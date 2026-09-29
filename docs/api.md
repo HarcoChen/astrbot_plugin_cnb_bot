@@ -81,3 +81,7 @@ NPC 本身的配置和能力（比如能不能读 zip 附件）见 [CNB NPC 文�
 - 日志文件要么由适配器提供本地路径（`File.file_`），要么提供下载 URL（`File.url`）。有本地路径时优先用本地路径。
 
 参考：[AstrBot 消息事件](https://docs.astrbot.app/dev/star/guides/listen-message-event.html)、[AstrBot 主动消息](https://docs.astrbot.app/dev/star/guides/send-message.html)。
+
+## QQ 官方指令面板
+
+启用 `qq_command_panel_enabled` 后，插件使用 `qq_command_panel_app_id` 和 `qq_command_panel_client_secret` 获取 QQ Bot `access_token`，然后对 `/v2/panels` 同步本插件标记的单聊与群聊全局面板。它只更新备注为 `astrbot_plugin_cnb_bot:managed_command_panel` 的面板，不删除其他面板。详见 [QQ 官方菜单与指令面板文档](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/menu-panel/) 和 [访问凭证说明](https://bot.q.qq.com/wiki/develop/api-v2/dev-prepare/access-token.html)。

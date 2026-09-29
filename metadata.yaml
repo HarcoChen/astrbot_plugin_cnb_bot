@@ -7,6 +7,7 @@ repo: "https://github.com/HarcoChen/astrbot_plugin_cnb_bot"
 astrbot_version: ">=4.16,<5"
 support_platforms:
   - aiocqhttp
+  - qq_official
 tags:
   - CNB
   - QQ

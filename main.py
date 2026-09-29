@@ -154,18 +154,54 @@ class CNBReportPlugin(Star):
         data_dir.mkdir(parents=True, exist_ok=True)
         self.store = TaskStore(data_dir / "reports.sqlite3")
         self.jobs = ReportJobs(context, self.config, self.store, data_dir)
+        self._command_panel_sync_task: asyncio.Task | None = None
+        self._command_panel_sync_started = False
+
+    def _schedule_command_panel_sync(self) -> None:
+        if (
+            not self.config.get("qq_command_panel_enabled", False)
+            or self._command_panel_sync_started
+        ):
+            return
+        self._command_panel_sync_started = True
+        self._command_panel_sync_task = asyncio.create_task(
+            self._sync_command_panels(), name="cnb-qq-command-panel-sync"
+        )
+
+    async def _sync_command_panels(self) -> None:
+        from .qq_command_panel import sync_qq_command_panels
+
+        app_id = str(self.config.get("qq_command_panel_app_id", "") or "")
+        client_secret = str(self.config.get("qq_command_panel_client_secret", "") or "")
+        try:
+            results = await asyncio.to_thread(
+                sync_qq_command_panels, app_id, client_secret
+            )
+        except Exception:
+            logger.exception("QQ 指令面板同步失败；报障指令仍可通过聊天消息使用。")
+            return
+        logger.info(
+            "QQ 指令面板同步完成：单聊面板 %s，群聊面板 %s。",
+            results["c2c"],
+            results["group"],
+        )
 
     async def initialize(self) -> None:
         # Plugin initialization also runs on hot reload; the global loaded event
         # alone does not cover that lifecycle.
         self.jobs.start()
+        self._schedule_command_panel_sync()
 
     @filter.on_astrbot_loaded()
     async def on_astrbot_loaded(self) -> None:
         self.jobs.start()
+        self._schedule_command_panel_sync()
 
     async def terminate(self) -> None:
         await self.jobs.shutdown()
+        if self._command_panel_sync_task and not self._command_panel_sync_task.done():
+            self._command_panel_sync_task.cancel()
+            await asyncio.gather(self._command_panel_sync_task, return_exceptions=True)
         self.store.close()
 
     @filter.command("debug")

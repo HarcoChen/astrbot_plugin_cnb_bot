@@ -41,7 +41,7 @@
 ## 环境要求
 
 - AstrBot 4.16 及以上的 4.x 版本
-- `aiocqhttp`（OneBot v11）适配器，需要能收到群文件消息
+- `aiocqhttp`（OneBot v11）或 `qq_official` 适配器，需要能收到群文件消息；QQ 官方机器人适配器需要 AstrBot 4.19.6 及以上版本
 - 一个 CNB 仓库，并且仓库里配好了能被 @ 触发的 NPC
 
 
@@ -52,10 +52,12 @@
 | --- | --- |
 | `cnb_repository` | 仓库路径，如 `group/repo` |
 | `cnb_token` | CNB 访问令牌，需要 `repo-issue:rw`、`repo-notes:r`、`repo-notes:rw` |
-| `group_whitelist` | 允许报障的 QQ 群号；只用私信的话可以留空 |
+| `group_whitelist` | 允许报障的群；OneBot 填 QQ 群号，QQ 官方机器人填群 OpenID；只用私信可留空 |
 | `npc_author_usernames` | NPC 回复作者的 username，默认 `CodeBuddy`，请按仓库里实际的回复账号填写 |
 
 私信默认对所有人开放。其余配置项见 [配置说明](docs/configuration.md)。
+
+QQ 官方机器人可在插件配置中启用指令面板同步。启用后需填写 QQ 开放平台 AppID 和机器人密钥；插件会在单聊和群聊场景创建或更新自己的全局面板。OneBot 部署不需要这些配置，继续使用 `/debug help` 等聊天指令。
 
 ## 指令
 

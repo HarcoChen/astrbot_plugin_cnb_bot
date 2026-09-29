@@ -1,7 +1,7 @@
 {
   "group_whitelist": {
-    "description": "启用报障功能的 QQ 群号",
-    "hint": "留空时所有群均不启用。",
+    "description": "启用报障功能的群 ID",
+    "hint": "OneBot 填 QQ 群号；QQ 官方机器人填群 OpenID。留空时所有群均不启用。",
     "type": "list",
     "default": []
   },
@@ -10,6 +10,26 @@
     "hint": "留空时允许所有用户私信报障；填写后仅允许名单内的平台用户 ID。",
     "type": "list",
     "default": []
+  },
+  "qq_command_panel_enabled": {
+    "description": "同步 QQ 官方指令面板",
+    "hint": "开启后插件启动时会创建或更新 QQ 开放平台的单聊和群聊面板；aiocqhttp/OneBot 不填写这些凭据时仍可正常使用聊天指令。",
+    "type": "bool",
+    "default": false
+  },
+  "qq_command_panel_app_id": {
+    "description": "QQ 官方机器人 AppID",
+    "hint": "仅在启用 QQ 官方指令面板同步时填写。",
+    "type": "string",
+    "default": ""
+  },
+  "qq_command_panel_client_secret": {
+    "description": "QQ 官方机器人密钥",
+    "hint": "与 AppID 对应的开放平台机器人密钥，仅在启用指令面板同步时填写。",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "obvious_hint": true
   },
   "reply_in_disabled_groups": {
     "description": "在未启用的群里回复提示",
